@@ -81,6 +81,8 @@ vela-companion = { git = "https://github.com/jhd3197/vela-companion" }
 
 # FTP / FTPS — sync API, driven from tokio via spawn_blocking.
 suppaftp = { version = "6", features = ["native-tls"] }
+# FTP charset support (non-UTF-8 servers): see session/ftp.rs.
+encoding_rs = "0.8"
 
 # S3 / R2 / B2 — Apache Arrow's polymorphic object_store crate. The same crate
 # backs Azure Blob (`azure` feature) and native Google Cloud Storage (`gcp`).
@@ -193,3 +195,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# suppaftp 6.3.0 plus a small patch (a pluggable charset for commands and
+# listings) so FTP servers that don't speak UTF-8 work — upstream has no hook
+# for it. See vendor/suppaftp/FARO_PATCH.md.
+[patch.crates-io]
+suppaftp = { path = "vendor/suppaftp" }

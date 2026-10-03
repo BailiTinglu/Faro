@@ -99,6 +99,10 @@ export interface ConnectionProfile {
   jumpHost?: string;
   jumpPort?: number;
   jumpUsername?: string;
+  /** FTP/FTPS character set for path names. Absent = auto (UTF-8, falling
+   *  back to Windows-1252 when the server sends non-UTF-8 names); otherwise a
+   *  WHATWG label like "windows-1252" or "shift_jis". */
+  ftpEncoding?: string;
 }
 
 export const PROTOCOL_DEFAULT_PORT: Record<Protocol, number> = {
@@ -305,6 +309,7 @@ export interface ProfilePreview {
   username: string;
   identityFile?: string;
   note?: string;
+  ftpEncoding?: string;
 }
 
 export type ImporterKind = "openssh" | "filezilla" | "putty";

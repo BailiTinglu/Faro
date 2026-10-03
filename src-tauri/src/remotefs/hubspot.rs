@@ -838,6 +838,7 @@ mod tests {
             jump_host: None,
             jump_port: None,
             jump_username: None,
+            ftp_encoding: None,
         };
 
         let pid = profile.id.clone();
@@ -1091,6 +1092,7 @@ mod tests {
             jump_host: None,
             jump_port: None,
             jump_username: None,
+            ftp_encoding: None,
         };
 
         let pid = profile.id.clone();

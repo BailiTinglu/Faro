@@ -1,0 +1,92 @@
+[package]
+name = "suppaftp"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+repository = { workspace = true }
+documentation = "https://docs.rs/suppaftp/"
+description = "A super FTP/FTPS client library for Rust"
+include = [
+  "examples/**/*",
+  "src/**/*",
+  "../LICENSE-APACHE",
+  "../LICENSE-MIT",
+  "../README.md",
+  "../CHANGELOG.md",
+]
+readme = "../README.md"
+
+
+[lib]
+name = "suppaftp"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { version = "^0.4", default-features = false, features = ["clock"] }
+lazy-regex = "^3"
+log = "^0.4"
+thiserror = "^2"
+# async
+async-std = { version = "^1.10", optional = true }
+async-native-tls-crate = { package = "async-native-tls", version = "^0.5", optional = true }
+async-trait = { version = "0.1.64", optional = true }
+futures-rustls = { version = "^0.26", optional = true }
+pin-project = { version = "^1", optional = true }
+rustls-pki-types = { version = "1", optional = true, features = ["alloc"] }
+# secure
+native-tls-crate = { package = "native-tls", version = "^0.2", optional = true }
+rustls-crate = { package = "rustls", version = "^0.23", default-features = false, features = [
+  "logging",
+  "ring",
+  "std",
+  "tls12",
+], optional = true }
+futures-lite = "2"
+
+[dev-dependencies]
+async-attributes = "1.1.2"
+env_logger = "^0.11"
+pretty_assertions = "^1.0.0"
+rand = "^0.9"
+serial_test = "^3.0"
+testcontainers = { version = "0.24", features = ["blocking"] }
+webpki-roots = "1"
+
+[features]
+default = []
+# Enable async support for suppaftp
+async = ["dep:async-std", "dep:async-trait", "dep:pin-project"]
+async-default-tls = ["async-native-tls"]
+async-native-tls = ["dep:async-native-tls-crate", "async-secure"]
+async-rustls = ["dep:futures-rustls", "dep:rustls-pki-types", "async-secure"]
+async-secure = ["async"]
+
+# Enable deprecated FTP/FTPS methods
+deprecated = []
+
+# Enable support for FTPS which requires native-tls (openssl is required on Linux) or RustTLS
+default-tls = ["native-tls"]
+native-tls = ["native-tls-crate", "secure"]
+native-tls-vendored = ["native-tls", "native-tls-crate/vendored"]
+async-native-tls-vendored = [
+  "async-native-tls",
+  "async-native-tls-crate/vendored",
+]
+rustls = ["rustls-crate", "secure"]
+secure = []
+
+# Disable logging
+no-log = ["log/max_level_off"]
+
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "rustls"
+required-features = ["rustls"]

@@ -1554,6 +1554,7 @@ dependencies = [
  "bytes",
  "cloud-filter",
  "dirs 5.0.1",
+ "encoding_rs",
  "faro-agent-proto",
  "faro-agentd",
  "flate2",
@@ -5690,8 +5691,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "suppaftp"
 version = "6.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9d869e942cc5f349ad91645925a9e6b570f62c4c170ad1c7b92b867bd16bd54"
 dependencies = [
  "chrono",
  "futures-lite",

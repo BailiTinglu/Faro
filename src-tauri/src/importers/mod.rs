@@ -30,6 +30,10 @@ pub struct ProfilePreview {
     /// "from ~/.ssh/config", "site folder: Personal/Work", etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// FTP character set carried over from the source (FileZilla's
+    /// per-site "Charset" setting). `None` means auto.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ftp_encoding: Option<String>,
 }
 
 impl ProfilePreview {
@@ -43,6 +47,7 @@ impl ProfilePreview {
             username: String::new(),
             identity_file: None,
             note: None,
+            ftp_encoding: None,
         }
     }
 
@@ -82,6 +87,7 @@ impl ProfilePreview {
             jump_host: None,
             jump_port: None,
             jump_username: None,
+            ftp_encoding: self.ftp_encoding,
         }
     }
 }

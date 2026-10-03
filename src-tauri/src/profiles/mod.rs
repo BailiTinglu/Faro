@@ -79,6 +79,11 @@ pub struct ConnectionProfile {
     pub jump_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jump_username: Option<String>,
+    // FTP/FTPS character set for path names: absent or "auto" negotiates
+    // UTF-8 and falls back to Windows-1252; otherwise a WHATWG label
+    // ("utf-8", "windows-1252", "shift_jis", "gbk", ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ftp_encoding: Option<String>,
 }
 
 // Plain JSON file in the app data dir. v0.2 moves secrets into the OS

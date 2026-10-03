@@ -319,6 +319,7 @@ mod tests {
             jump_host: None,
             jump_port: None,
             jump_username: None,
+            ftp_encoding: None,
         };
         let session = Arc::new(onedrive_connect(&profile).await.expect("connect"));
 
