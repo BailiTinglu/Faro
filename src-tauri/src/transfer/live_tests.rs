@@ -292,8 +292,9 @@ async fn live_sftp_download_throughput_and_integrity() {
     let old = mbps(n, started.elapsed());
     drop(f);
 
-    // After: the new pipeline on the whole 256 MiB file.
+    // After: the new pipeline on the whole 256 MiB file, checksum-verified.
     let mgr = Arc::new(TransferManager::new());
+    mgr.set_verify(true);
     let remote = "/home/faro/data/big.bin";
     let (t, took, peak) = download(&mgr, &session, remote, &dir).await;
     assert_eq!(t.status, TransferStatus::Done, "{:?}", t.error);
@@ -315,6 +316,7 @@ async fn live_sftp_upload_and_pause_resume() {
     let local = dir.join("up.bin");
     random_file(&local, 64);
     let mgr = Arc::new(TransferManager::new());
+    mgr.set_verify(true);
     let remote = "/home/faro/up.bin";
     let (t, took, _) = upload(&mgr, &session, &local, remote).await;
     assert_eq!(t.status, TransferStatus::Done, "{:?}", t.error);
@@ -375,6 +377,8 @@ async fn object_round_trip(var: &str) {
     let local = dir.join("blob.bin");
     random_file(&local, 200);
     let mgr = Arc::new(TransferManager::new());
+    // S3: the multipart ETag is checked against the parts' MD5s.
+    mgr.set_verify(true);
     let key = format!("faro-live/{}.bin", Uuid::new_v4().simple());
     let (t, took, peak_up) = upload(&mgr, &session, &local, &key).await;
     assert_eq!(t.status, TransferStatus::Done, "{:?}", t.error);

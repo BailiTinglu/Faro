@@ -1562,6 +1562,7 @@ dependencies = [
  "image",
  "keyring",
  "libc",
+ "md-5",
  "mdns-sd",
  "notify",
  "object_store",

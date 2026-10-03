@@ -77,7 +77,11 @@ pub enum Verdict {
 pub fn classify(e: &anyhow::Error) -> Verdict {
     use Verdict::*;
     for cause in e.chain() {
-        if cause.is::<super::Paused>() || cause.is::<RemoteChanged>() || cause.is::<Exhausted>() {
+        if cause.is::<super::Paused>()
+            || cause.is::<RemoteChanged>()
+            || cause.is::<Exhausted>()
+            || cause.is::<super::verify::VerifyFailed>()
+        {
             return Fatal;
         }
         if cause.is::<Transient>() || cause.is::<RetryAfter>() {

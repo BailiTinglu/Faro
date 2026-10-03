@@ -23,6 +23,7 @@ mod ranged;
 mod retry;
 mod sources;
 mod speed;
+mod verify;
 
 pub use partfile::is_part_file;
 use speed::Live;
@@ -440,6 +441,8 @@ struct ObjectStash {
     offset: u64,
     local: LocalIdentity,
     key: String,
+    /// MD5 of each part sent so far (ETag check, Phase 6).
+    part_md5s: Vec<[u8; 16]>,
 }
 
 /// The Skip policy found the target already there when the download was
@@ -890,15 +893,79 @@ impl TransferManager {
         self.object_uploads.lock().await.remove(id);
     }
 
-    /// Integrity checks beyond size and range coverage (Phase 6).
+    /// Checksum a finished download against the server when the
+    /// `transferVerify` setting is on and the backend can produce one
+    /// (Phase 6). Size and range coverage are checked regardless.
     async fn verify_download(
         &self,
-        _id: &str,
-        _session: &Arc<Session>,
-        _remote_path: &str,
-        _ident: &sources::RemoteIdentity,
-        _finished: &partfile::Finished,
+        session: &Arc<Session>,
+        remote_path: &str,
+        part_path: &Path,
+        finished: &partfile::Finished,
     ) -> Result<()> {
+        if !self.verify_enabled() {
+            return Ok(());
+        }
+        match &**session {
+            Session::Ssh(ssh) => {
+                let (Some(local), Some(remote)) =
+                    (finished.sha256.as_deref(), verify::remote_sha256(ssh, remote_path).await)
+                else {
+                    tracing::info!("{remote_path}: no remote sha256; checked size only");
+                    return Ok(());
+                };
+                if local != remote {
+                    return Err(verify::mismatch("SHA-256", local, &remote));
+                }
+            }
+            Session::Agent(agent) => {
+                let remote = verify::agent_hash(agent, remote_path).await?;
+                let local = verify::local_agent_hash(part_path).await?;
+                if local != remote {
+                    return Err(verify::mismatch("BLAKE3", &local, &remote));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Checksum a finished upload against the server (Phase 6). Object-store
+    /// uploads check their ETag inside [`Self::run_object_upload`]; delta
+    /// uploads are hash-checked by the daemon already.
+    async fn verify_upload(
+        &self,
+        id: &str,
+        session: &Arc<Session>,
+        local: &Path,
+        remote_path: &str,
+    ) -> Result<()> {
+        if !self.verify_enabled() {
+            return Ok(());
+        }
+        match &**session {
+            Session::Ssh(ssh) => {
+                let Some(remote) = verify::remote_sha256(ssh, remote_path).await else {
+                    tracing::info!("{remote_path}: no remote sha256; checked size only");
+                    return Ok(());
+                };
+                let local = verify::local_sha256(local).await?;
+                if local != remote {
+                    return Err(verify::mismatch("SHA-256", &local, &remote));
+                }
+            }
+            Session::Agent(agent) => {
+                if self.get(id).await.is_some_and(|t| t.delta.is_some()) {
+                    return Ok(());
+                }
+                let remote = verify::agent_hash(agent, remote_path).await?;
+                let local = verify::local_agent_hash(local).await?;
+                if local != remote {
+                    return Err(verify::mismatch("BLAKE3", &local, &remote));
+                }
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -1994,8 +2061,15 @@ impl TransferManager {
                 finished.len
             );
         }
-        self.verify_download(id, session, remote_path, &ident, &finished)
-            .await?;
+        if let Err(e) = self
+            .verify_download(session, remote_path, &part_path, &finished)
+            .await
+        {
+            // Keep the temp for inspection, but never move it into place or
+            // resume onto it.
+            self.forget_resume(id, false).await;
+            return Err(e);
+        }
         let placed = partfile::place(&part_path, target, policy, ident.mtime_systime()).await?;
         self.forget_resume(id, false).await;
         match placed {
@@ -2334,16 +2408,24 @@ impl TransferManager {
             .await
             .with_context(|| format!("open {}", local_path.display()))?;
 
+        // S3-style ETags are MD5s of what was sent (Phase 6).
+        let check_etag = self.verify_enabled() && session.profile.protocol == "s3";
         if size <= OBJECT_SINGLE_PUT_MAX {
             // object_store needs the body in memory; 16 MiB at most.
             self.checkpoint(id, size).await?;
             let mut buf = Vec::with_capacity(size as usize);
             file.read_to_end(&mut buf).await?;
-            session
+            let want = check_etag.then(|| verify::hex(&verify::md5(&buf)));
+            let put = session
                 .store
                 .put(&p, bytes::Bytes::from(buf).into())
                 .await
                 .with_context(|| format!("s3 put {key}"))?;
+            if let (Some(want), Some(etag)) = (want, put.e_tag.as_deref()) {
+                if verify::etag_matches(etag, &want) == Some(false) {
+                    return Err(verify::mismatch("ETag", &want, etag));
+                }
+            }
             self.progress(id, size);
             return Ok(size);
         }
@@ -2357,15 +2439,15 @@ impl TransferManager {
             .await
             .remove(id)
             .filter(|s| s.local == local && s.key == key);
-        let (mut upload, mut offset) = match stash {
-            Some(s) => (s.guard, s.offset),
+        let (mut upload, mut offset, mut part_md5s) = match stash {
+            Some(s) => (s.guard, s.offset, s.part_md5s),
             None => {
                 let up = session
                     .store
                     .put_multipart(&p)
                     .await
                     .with_context(|| format!("s3 begin multipart {key}"))?;
-                (MultipartGuard::new(up, key.clone()), 0)
+                (MultipartGuard::new(up, key.clone()), 0, Vec::new())
             }
         };
         file.seek(std::io::SeekFrom::Start(offset)).await?;
@@ -2381,6 +2463,9 @@ impl TransferManager {
                     let mut buf = vec![0u8; want];
                     file.read_exact(&mut buf).await?;
                     self.checkpoint(id, want as u64).await?;
+                    if check_etag {
+                        part_md5s.push(verify::md5(&buf));
+                    }
                     let part = upload.get().put_part(bytes::Bytes::from(buf).into());
                     sent += want as u64;
                     inflight.push(async move { part.await.map(|()| want as u64) });
@@ -2419,16 +2504,25 @@ impl TransferManager {
                             offset,
                             local,
                             key,
+                            part_md5s,
                         },
                     );
                 }
             }
             return Err(e);
         }
-        upload
+        let done = upload
             .complete()
             .await
             .with_context(|| format!("s3 complete multipart {key}"))?;
+        if check_etag {
+            if let Some(etag) = done.e_tag.as_deref() {
+                let want = verify::multipart_etag(&part_md5s);
+                if verify::etag_matches(etag, &want) == Some(false) {
+                    return Err(verify::mismatch("multipart ETag", &want, etag));
+                }
+            }
+        }
         Ok(offset)
     }
 }
@@ -3764,6 +3858,18 @@ async fn dispatch_upload(
     local: &Path,
     final_remote: &str,
 ) -> Result<u64> {
+    let n = upload_by_backend(mgr, id, session, local, final_remote).await?;
+    mgr.verify_upload(id, session, local, final_remote).await?;
+    Ok(n)
+}
+
+async fn upload_by_backend(
+    mgr: &Arc<TransferManager>,
+    id: &str,
+    session: &Arc<Session>,
+    local: &Path,
+    final_remote: &str,
+) -> Result<u64> {
     match &**session {
         Session::Ssh(ssh) => {
             mgr.run_ssh_upload(id, ssh.clone(), local, final_remote)
@@ -4713,6 +4819,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `transferVerify` (Phase 6): an Agent download checks the daemon's
+    /// BLAKE3 hash; a temp that doesn't match fails, is kept, and is never
+    /// moved into place.
+    #[tokio::test]
+    async fn verify_checks_the_agent_hash_and_keeps_a_bad_temp() {
+        let dir = test_dirs("verify");
+        let remote = dir.join("remote/v.bin");
+        let remote_s = remote.to_string_lossy().into_owned();
+        std::fs::write(&remote, det_bytes(0x61, 3 * 1024 * 1024)).unwrap();
+        let session = delta_test_session(false).await;
+        let local = dir.join("local/v.bin");
+
+        let mgr = delta_test_manager("v", TransferKind::Download, &remote_s, &local.to_string_lossy(), 0).await;
+        mgr.set_verify(true);
+        mgr.agent_download_with_delta_core("v", &session, &remote_s, &local)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&local).unwrap(), std::fs::read(&remote).unwrap());
+
+        // A temp whose bytes don't match the server's hash.
+        let part = dir.join("local/bad.bin.faro-part");
+        std::fs::write(&part, b"not the same bytes").unwrap();
+        let finished = partfile::Finished {
+            len: 18,
+            sha256: None,
+        };
+        let agent = Arc::new(Session::Agent(Arc::clone(&session)));
+        let err = mgr
+            .verify_download(&agent, &remote_s, &part, &finished)
+            .await
+            .unwrap_err();
+        assert!(err.is::<verify::VerifyFailed>(), "{err:#}");
+        assert_eq!(retry::classify(&err), retry::Verdict::Fatal);
+        assert!(part.exists(), "kept for inspection");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Cancel discards the temp and the record; an error keeps both.
     #[tokio::test]
     async fn cancel_discards_the_partial_download() {
@@ -4725,11 +4868,14 @@ mod tests {
         let target = dir.join("local/c.bin");
         let mgr = Arc::new(TransferManager::new());
         mgr.set_db(Arc::clone(&db));
-        mgr.set_throttle_kbps(2 * 1024);
+        // The in-memory store hands over a range as one chunk, which the
+        // throttle then holds back for minutes: the run is mid-flight.
+        mgr.set_throttle_kbps(16);
         let job = queue_download(&mgr, "c", &session, "c.bin", &target, data.len() as u64).await;
         let task = tokio::spawn(run_job(Arc::clone(&mgr), "c".into(), job));
         mgr.tasks.lock().await.insert("c".into(), task);
-        while mgr.live("c").get() < 1024 * 1024 {
+        let part = partfile::part_path_for(&target);
+        while db.resume_list().unwrap().is_empty() || !part.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(db.resume_list().unwrap().len(), 1);
