@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ServerRail } from "./components/ServerRail";
 import { DualPaneBrowser } from "./components/DualPaneBrowser";
 import { FileBrowser } from "./components/FileBrowser";
@@ -250,6 +251,8 @@ function StatusBar({
   // every other overlay closes (the hover-leave behavior stays as a bonus).
   const editsWrapRef = useRef<HTMLDivElement>(null);
   const notifWrapRef = useRef<HTMLDivElement>(null);
+  const editsPopRef = useRef<HTMLDivElement>(null);
+  const notifPopRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!notifOpen && !editsMenuOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -259,8 +262,12 @@ function StatusBar({
     };
     const onDown = (e: MouseEvent) => {
       const t = e.target as Node;
-      if (notifOpen && !notifWrapRef.current?.contains(t)) setNotifOpen(false);
-      if (editsMenuOpen && !editsWrapRef.current?.contains(t)) onCloseEditsMenu();
+      const outside = (...els: (HTMLElement | null)[]) =>
+        !els.some((el) => el?.contains(t));
+      if (notifOpen && outside(notifWrapRef.current, notifPopRef.current))
+        setNotifOpen(false);
+      if (editsMenuOpen && outside(editsWrapRef.current, editsPopRef.current))
+        onCloseEditsMenu();
     };
     window.addEventListener("keydown", onKey);
     window.addEventListener("mousedown", onDown);
@@ -312,8 +319,9 @@ function StatusBar({
             Editing
           </PillButton>
           {editsMenuOpen && (
-            <div
-              className="anim-modal absolute bottom-7 right-0 z-dropdown w-80 overflow-hidden rounded-md border border-border bg-bg-panel shadow-elev-3"
+            <StatusPopover
+              anchorRef={editsWrapRef}
+              popRef={editsPopRef}
               onMouseLeave={onCloseEditsMenu}
             >
               <div className="border-b border-border bg-bg-subtle px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-text-muted">
@@ -356,7 +364,7 @@ function StatusBar({
                   </div>
                 );
               })}
-            </div>
+            </StatusPopover>
           )}
         </div>
       )}
@@ -373,8 +381,9 @@ function StatusBar({
           title="Notifications"
         />
         {notifOpen && (
-          <div
-            className="anim-modal absolute bottom-7 right-0 z-dropdown w-80 overflow-hidden rounded-md border border-border bg-bg-panel shadow-elev-3"
+          <StatusPopover
+            anchorRef={notifWrapRef}
+            popRef={notifPopRef}
             onMouseLeave={() => setNotifOpen(false)}
           >
             <div className="flex items-center justify-between border-b border-border bg-bg-subtle px-3 py-1.5">
@@ -417,7 +426,7 @@ function StatusBar({
                 ))}
               </div>
             )}
-          </div>
+          </StatusPopover>
         )}
       </div>
       <PillButton
@@ -507,6 +516,38 @@ function StatusBar({
         </div>
       )}
     </div>
+  );
+}
+
+/// Status-bar popover, portaled to <body>: the bar clips its overflow (so it
+/// never scrolls sideways on narrow windows), which would hide an absolutely
+/// positioned child. Anchored above the pill's wrapper, right-aligned to it.
+function StatusPopover({
+  anchorRef,
+  popRef,
+  onMouseLeave,
+  children,
+}: {
+  anchorRef: React.RefObject<HTMLDivElement>;
+  popRef: React.RefObject<HTMLDivElement>;
+  onMouseLeave: () => void;
+  children: React.ReactNode;
+}) {
+  const r = anchorRef.current?.getBoundingClientRect();
+  if (!r) return null;
+  return createPortal(
+    <div
+      ref={popRef}
+      style={{
+        bottom: window.innerHeight - r.top + 6,
+        right: Math.max(8, window.innerWidth - r.right),
+      }}
+      className="anim-modal fixed z-dropdown w-80 overflow-hidden rounded-md border border-border bg-bg-panel shadow-elev-3"
+      onMouseLeave={onMouseLeave}
+    >
+      {children}
+    </div>,
+    document.body
   );
 }
 
