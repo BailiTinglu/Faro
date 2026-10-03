@@ -44,19 +44,24 @@ pub enum TransferStatus {
     Canceled,
 }
 
-/// Marker error: a paused transfer was resumed — the copy loop unwinds with
-/// this and the runner re-runs the file from byte 0 (Plan 17 Phase 2).
-/// Honest on every backend: no per-backend seek support needed.
+/// Marker error: the transfer (or the whole queue) was paused at a chunk
+/// checkpoint. The copy loop unwinds with this; the runner gives back its
+/// concurrency slot, re-queues the transfer and waits for its turn again, so
+/// pausing never stalls the rest of the queue (Plan 24 Phase 1).
 #[derive(Debug)]
-struct RestartFromPause;
+struct Paused;
 
-impl std::fmt::Display for RestartFromPause {
+impl std::fmt::Display for Paused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("transfer resumed after pause; restarting file from the beginning")
+        f.write_str("transfer paused")
     }
 }
 
-impl std::error::Error for RestartFromPause {}
+impl std::error::Error for Paused {}
+
+fn is_paused(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Paused>().is_some()
+}
 
 /// Bytes between FTP checkpoint round-trips (throttle, pause, progress).
 const FTP_CHUNK: u64 = 256 * 1024;
@@ -256,15 +261,6 @@ impl PauseGate {
     fn set(&self, paused: bool) {
         let _ = self.tx.send(paused);
     }
-    /// Park until the gate opens. Returns immediately if already open.
-    async fn wait_open(&self) {
-        let mut rx = self.tx.subscribe();
-        while *rx.borrow_and_update() {
-            if rx.changed().await.is_err() {
-                break;
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -321,6 +317,15 @@ enum RetryInfo {
         local: PathBuf,
         final_remote: String,
     },
+    /// Unit tests drive the runner with a fake copy loop.
+    #[cfg(test)]
+    Test(
+        Arc<
+            dyn Fn(Arc<TransferManager>, String) -> futures::future::BoxFuture<'static, Result<u64>>
+                + Send
+                + Sync,
+        >,
+    ),
 }
 
 /// Default bound on concurrently running transfers (Plan 17); the rest wait
@@ -354,6 +359,10 @@ pub struct TransferManager {
     /// live-adjustable like the concurrency bound. `FARO_DELTA=0` still
     /// force-disables regardless of this flag.
     delta_enabled: AtomicBool,
+    /// Where events go. Bound by the first public call that carries an
+    /// `AppHandle` (or `set_app` at startup); unset in unit tests, where
+    /// emits are simply skipped.
+    app: std::sync::OnceLock<AppHandle>,
 }
 
 fn now_ts() -> i64 {
@@ -445,6 +454,19 @@ impl TransferManager {
             queue_gen: watch::channel(0).0,
             bucket: TokenBucket::new(),
             delta_enabled: AtomicBool::new(true),
+            app: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Bind the app handle events are emitted through.
+    pub fn set_app(&self, app: &AppHandle) {
+        let _ = self.app.set(app.clone());
+    }
+
+    /// Emit a transfer event when an app is bound (always, outside tests).
+    fn emit<S: Serialize + Clone>(&self, event: &str, payload: &S) {
+        if let Some(app) = self.app.get() {
+            let _ = app.emit(event, payload);
         }
     }
 
@@ -494,12 +516,18 @@ impl TransferManager {
     /// Emit `transfer://queue` and bump the generation so admission waiters
     /// re-check whether it is their turn.
     async fn bump_queue(&self, app: &AppHandle) {
+        self.set_app(app);
+        self.bump_queue_quiet().await;
+    }
+
+    /// [`Self::bump_queue`] through the bound app handle.
+    async fn bump_queue_quiet(&self) {
         let state = {
             let w = self.waiting.lock().await;
             self.build_queue_state(&w)
         };
         self.queue_gen.send_modify(|g| *g += 1);
-        let _ = app.emit("transfer://queue", &state);
+        self.emit("transfer://queue", &state);
     }
 
     /// Wait until this transfer is at the front of the FIFO with the pause-all
@@ -594,27 +622,58 @@ impl TransferManager {
     }
 
     /// Chunk-boundary checkpoint shared by every copy loop (Plan 17). Draws
-    /// `bytes` from the global bandwidth bucket (Phase 4), then — when the
-    /// transfer (or the whole manager) is paused — parks until resumed and
-    /// returns `RestartFromPause` so the runner re-runs the file from byte 0.
+    /// `bytes` from the global bandwidth bucket (Phase 4), then fails with
+    /// [`Paused`] when the transfer (or the whole manager) is paused. The
+    /// runner releases the concurrency slot and re-queues (Plan 24 Phase 1);
+    /// parking here would hold the slot and stall the queue.
     async fn checkpoint(&self, id: &str, bytes: u64) -> Result<()> {
         self.bucket.acquire(bytes).await;
-        let gate = self.pauses.lock().await.get(id).cloned();
-        let parked = self.pause_all.is_paused() || gate.as_ref().is_some_and(|g| g.is_paused());
-        if !parked {
-            return Ok(());
+        if self.is_gated(id).await {
+            return Err(Paused.into());
         }
-        // Park until BOTH gates are open (resume requires both).
-        loop {
-            self.pause_all.wait_open().await;
-            if let Some(g) = &gate {
-                g.wait_open().await;
-            }
-            if !self.pause_all.is_paused() && gate.as_ref().is_none_or(|g| !g.is_paused()) {
-                break;
+        Ok(())
+    }
+
+    /// Is this transfer held back by its own pause gate or by pause-all?
+    async fn is_gated(&self, id: &str) -> bool {
+        if self.pause_all.is_paused() {
+            return true;
+        }
+        self.pauses
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|g| g.is_paused())
+    }
+
+    /// A running transfer stopped at a checkpoint because of a pause: put it
+    /// back at the front of the FIFO (so it is the first to run again once
+    /// resumed) and show it as Paused, or Queued when only pause-all held it.
+    async fn requeue_paused(&self, id: &str) {
+        {
+            let mut w = self.waiting.lock().await;
+            if !w.iter().any(|x| x == id) {
+                w.push_front(id.to_string());
             }
         }
-        Err(RestartFromPause.into())
+        let own_pause = self
+            .pauses
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|g| g.is_paused());
+        self.update(id, |t| {
+            t.status = if own_pause {
+                TransferStatus::Paused
+            } else {
+                TransferStatus::Queued
+            };
+        })
+        .await;
+        if let Some(t) = self.get(id).await {
+            self.emit("transfer://updated", &t);
+        }
+        self.bump_queue_quiet().await;
     }
 
     /// Pause a queued or transferring transfer. A running one parks at the
@@ -705,35 +764,7 @@ impl TransferManager {
         }
         self.waiting.lock().await.push_back(id.to_string());
         self.bump_queue(app).await;
-        let mgr = Arc::clone(self);
-        let id_for_task = id.to_string();
-        let app_for_task = app.clone();
-        let task = match info {
-            RetryInfo::Download {
-                session,
-                remote_path,
-                final_path,
-            } => tokio::spawn(run_download_task(
-                mgr,
-                id_for_task,
-                session,
-                remote_path,
-                final_path,
-                app_for_task,
-            )),
-            RetryInfo::Upload {
-                session,
-                local,
-                final_remote,
-            } => tokio::spawn(run_upload_task(
-                mgr,
-                id_for_task,
-                session,
-                local,
-                final_remote,
-                app_for_task,
-            )),
-        };
+        let task = tokio::spawn(run_job(Arc::clone(self), id.to_string(), info));
         self.tasks.lock().await.insert(id.to_string(), task);
         Ok(())
     }
@@ -863,16 +894,14 @@ impl TransferManager {
         self.pauses.lock().await.insert(id.clone(), PauseGate::new());
         self.bump_queue(&app).await;
 
-        let mgr = Arc::clone(self);
-        let id_for_task = id.clone();
-        let task = tokio::spawn(run_download_task(
-            mgr,
-            id_for_task,
-            session,
-            remote_path,
-            final_path,
-            app,
-        ));
+        let job = self
+            .retry
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("retry info registered above");
+        let task = tokio::spawn(run_job(Arc::clone(self), id.clone(), job));
         self.tasks.lock().await.insert(id.clone(), task);
         Ok(id)
     }
@@ -890,7 +919,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: Option<&AppHandle>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use base64::Engine as _;
         use faro_agent_proto::msg::{Request, Response};
         self.update(id, |t| t.status = TransferStatus::Transferring).await;
@@ -934,7 +963,7 @@ impl TransferManager {
         }
         local_file.flush().await?;
         self.update(id, |t| t.transferred = offset).await;
-        Ok(())
+        Ok(offset)
     }
 
     async fn run_ssh_download(
@@ -944,7 +973,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
 
@@ -980,7 +1009,7 @@ impl TransferManager {
         }
         local_file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
-        Ok(())
+        Ok(transferred)
     }
 
     pub async fn start_upload(
@@ -1044,16 +1073,14 @@ impl TransferManager {
         self.pauses.lock().await.insert(id.clone(), PauseGate::new());
         self.bump_queue(&app).await;
 
-        let mgr = Arc::clone(self);
-        let id_for_task = id.clone();
-        let task = tokio::spawn(run_upload_task(
-            mgr,
-            id_for_task,
-            session,
-            local,
-            final_remote,
-            app,
-        ));
+        let job = self
+            .retry
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("retry info registered above");
+        let task = tokio::spawn(run_job(Arc::clone(self), id.clone(), job));
         self.tasks.lock().await.insert(id.clone(), task);
         Ok(id)
     }
@@ -1069,7 +1096,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: Option<&AppHandle>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use base64::Engine as _;
         use faro_agent_proto::msg::{Request, Response};
         self.update(id, |t| t.status = TransferStatus::Transferring).await;
@@ -1119,7 +1146,7 @@ impl TransferManager {
             }
         }
         self.update(id, |t| t.transferred = offset).await;
-        Ok(())
+        Ok(offset)
     }
 
     /// Agent upload entry point (delta-sync Phase 2): attempt a block-level
@@ -1132,7 +1159,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.agent_upload_with_delta_core(id, &session, local_path, remote_path, Some(app))
             .await
     }
@@ -1146,7 +1173,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: Option<&AppHandle>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let size = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);
         let (_basis_size, basis_exists) = agent_stat(session, remote_path).await;
         if self.delta_enabled() && faro_agent_proto::delta::should_attempt_delta(size, basis_exists, true)
@@ -1155,7 +1182,7 @@ impl TransferManager {
                 .agent_delta_upload_core(id, session, local_path, remote_path, app)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(n) => return Ok(n),
                 Err(e) => {
                     tracing::warn!("delta upload fell back to whole-file copy: {e:#}");
                     self.update(id, |t| t.transferred = 0).await;
@@ -1179,7 +1206,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: Option<&AppHandle>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use base64::Engine as _;
         use faro_agent_proto::delta;
         use faro_agent_proto::msg::{Request, Response};
@@ -1329,7 +1356,7 @@ impl TransferManager {
                 let _ = app.emit("transfer://progress", &t);
             }
         }
-        Ok(())
+        Ok(size)
     }
 
     /// Agent download entry point (delta-sync Phase 2): mirror of
@@ -1341,7 +1368,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.agent_download_with_delta_core(id, &session, remote_path, local_path, Some(app))
             .await
     }
@@ -1355,7 +1382,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: Option<&AppHandle>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let (size, remote_exists) = agent_stat(session, remote_path).await;
         let basis_exists = tokio::fs::metadata(local_path).await.is_ok();
         if remote_exists
@@ -1366,7 +1393,7 @@ impl TransferManager {
                 .agent_delta_download_core(id, session, remote_path, local_path, app)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(n) => return Ok(n),
                 Err(e) => {
                     tracing::warn!("delta download fell back to whole-file copy: {e:#}");
                     self.update(id, |t| t.transferred = 0).await;
@@ -1390,7 +1417,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: Option<&AppHandle>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use base64::Engine as _;
         use faro_agent_proto::delta;
         use faro_agent_proto::msg::{Request, Response};
@@ -1560,7 +1587,7 @@ impl TransferManager {
                 let _ = app.emit("transfer://progress", &t);
             }
         }
-        Ok(())
+        Ok(size)
     }
 
     async fn run_ssh_upload(
@@ -1570,7 +1597,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
 
@@ -1606,7 +1633,7 @@ impl TransferManager {
         }
         remote_file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
-        Ok(())
+        Ok(transferred)
     }
 }
 
@@ -1759,7 +1786,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: Option<&AppHandle>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
         self.checkpoint(id, 0).await?;
@@ -1797,12 +1824,12 @@ impl TransferManager {
             sink.finish()?;
             Ok(())
         });
-        let (res, stop) = tokio::join!(copy, self.ftp_pump(id, app, rx, ack));
+        let (res, (stop, done)) = tokio::join!(copy, self.ftp_pump(id, app, rx, ack));
         // A pause/cancel at a checkpoint is the real reason the copy failed.
         if let Some(e) = stop {
             return Err(e);
         }
-        res
+        res.map(|()| done)
     }
 
     /// FTP upload: like the download, with `APPE` from the remote file's
@@ -1814,7 +1841,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: Option<&AppHandle>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use std::io::{Seek, SeekFrom};
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
@@ -1850,24 +1877,24 @@ impl TransferManager {
             reader.finish()?;
             Ok(())
         });
-        let (res, stop) = tokio::join!(copy, self.ftp_pump(id, app, rx, ack));
+        let (res, (stop, done)) = tokio::join!(copy, self.ftp_pump(id, app, rx, ack));
         if let Some(e) = stop {
             return Err(e);
         }
-        res
+        res.map(|()| done)
     }
 
     /// Async half of an FTP copy: for each chunk the blocking side reports,
     /// run the throttle/pause checkpoint, publish progress, then let the copy
     /// continue (or tell it to stop). Returns the checkpoint error that
-    /// stopped the copy, if any (`RestartFromPause`).
+    /// stopped the copy, if any ([`Paused`]), and the byte count reached.
     async fn ftp_pump(
         &self,
         id: &str,
         app: Option<&AppHandle>,
         mut rx: tokio::sync::mpsc::Receiver<FtpProgress>,
         ack: std::sync::mpsc::SyncSender<bool>,
-    ) -> Option<anyhow::Error> {
+    ) -> (Option<anyhow::Error>, u64) {
         let mut done = 0u64;
         let mut last_emit = Instant::now();
         while let Some(msg) = rx.recv().await {
@@ -1885,7 +1912,7 @@ impl TransferManager {
                 FtpProgress::Chunk(n) => {
                     if let Err(e) = self.checkpoint(id, n).await {
                         let _ = ack.send(false);
-                        return Some(e);
+                        return (Some(e), done);
                     }
                     done += n;
                     if last_emit.elapsed() > Duration::from_millis(100) {
@@ -1900,7 +1927,7 @@ impl TransferManager {
             }
         }
         self.update(id, |t| t.transferred = done).await;
-        None
+        (None, done)
     }
 
     async fn run_object_download(
@@ -1910,7 +1937,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
 
@@ -1946,7 +1973,7 @@ impl TransferManager {
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
-        Ok(())
+        Ok(transferred)
     }
 
     async fn run_object_upload(
@@ -1956,7 +1983,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use tokio::io::AsyncReadExt;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -1989,16 +2016,19 @@ impl TransferManager {
             if let Some(t) = self.get(id).await {
                 let _ = app.emit("transfer://progress", &t);
             }
-            return Ok(());
+            return Ok(size);
         }
 
         // Multipart path. object_store wants a `MultipartUpload` for which we
         // push parts and call complete() at the end.
-        let mut upload = session
+        let upload = session
             .store
             .put_multipart(&p)
             .await
             .with_context(|| format!("s3 begin multipart {key}"))?;
+        // Aborted on any error or cancel (task abort drops the guard), so a
+        // failed upload never leaves billable orphaned parts behind.
+        let mut upload = MultipartGuard::new(upload, key.to_string());
 
         const PART: usize = 8 * 1024 * 1024;
         let mut transferred: u64 = 0;
@@ -2019,6 +2049,7 @@ impl TransferManager {
             self.checkpoint(id, filled as u64).await?;
             let chunk = bytes::Bytes::copy_from_slice(&buf[..filled]);
             upload
+                .get()
                 .put_part(chunk.into())
                 .await
                 .with_context(|| format!("s3 put_part {key}"))?;
@@ -2039,7 +2070,7 @@ impl TransferManager {
             .await
             .with_context(|| format!("s3 complete multipart {key}"))?;
         self.update(id, |t| t.transferred = transferred).await;
-        Ok(())
+        Ok(transferred)
     }
 
     /// Stream a WebDAV download: a single ranged-capable `GET`, written to the
@@ -2051,7 +2082,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use futures::StreamExt;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -2091,7 +2122,7 @@ impl TransferManager {
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
-        Ok(())
+        Ok(transferred)
     }
 
     /// Upload via WebDAV `PUT`, streaming the file body straight off disk (no
@@ -2103,7 +2134,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use tokio_util::io::ReaderStream;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -2135,7 +2166,7 @@ impl TransferManager {
             ));
         }
         self.update(id, |t| t.transferred = size).await;
-        Ok(())
+        Ok(size)
     }
 
     /// Stream a read-only HTTP download: a single `GET`, written chunk by chunk.
@@ -2146,7 +2177,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use futures::StreamExt;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -2186,7 +2217,7 @@ impl TransferManager {
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
-        Ok(())
+        Ok(transferred)
     }
 
     /// Stream a Dropbox download: POST `/2/files/download` (path in the
@@ -2198,7 +2229,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use futures::StreamExt;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -2229,7 +2260,7 @@ impl TransferManager {
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
-        Ok(())
+        Ok(transferred)
     }
 
     /// Upload a file to Dropbox via `/2/files/upload` (overwrite mode). Simple
@@ -2242,7 +2273,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use tokio_util::io::ReaderStream;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -2302,7 +2333,7 @@ impl TransferManager {
             break;
         }
         self.update(id, |t| t.transferred = size).await;
-        Ok(())
+        Ok(size)
     }
 
     /// Download a Shopify theme asset. The Assets API answers with the whole
@@ -2315,7 +2346,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
         let _ = app; // single-shot API: progress is reported at completion.
@@ -2327,8 +2358,14 @@ impl TransferManager {
             .with_context(|| format!("create {}", local_path.display()))?;
         file.write_all(&data).await?;
         file.flush().await?;
-        self.update(id, |t| t.transferred = data.len() as u64).await;
-        Ok(())
+        // The listing's size is advisory for these APIs; the body is the truth.
+        let n = data.len() as u64;
+        self.update(id, |t| {
+            t.size = n;
+            t.transferred = n;
+        })
+        .await;
+        Ok(n)
     }
 
     /// Upload a file as a Shopify theme asset (create and update are the same
@@ -2340,7 +2377,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
         let _ = app; // Shopify reports at completion, like the Dropbox path.
@@ -2352,7 +2389,7 @@ impl TransferManager {
         self.checkpoint(id, size).await?;
         crate::remotefs::shopify::write_asset(&session, remote_path, &data).await?;
         self.update(id, |t| t.transferred = size).await;
-        Ok(())
+        Ok(size)
     }
 
     /// Download a HubSpot Design Manager file. The Source Code API answers
@@ -2365,7 +2402,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
         let _ = app; // single-shot API: progress is reported at completion.
@@ -2377,8 +2414,14 @@ impl TransferManager {
             .with_context(|| format!("create {}", local_path.display()))?;
         file.write_all(&data).await?;
         file.flush().await?;
-        self.update(id, |t| t.transferred = data.len() as u64).await;
-        Ok(())
+        // The listing's size is advisory for these APIs; the body is the truth.
+        let n = data.len() as u64;
+        self.update(id, |t| {
+            t.size = n;
+            t.transferred = n;
+        })
+        .await;
+        Ok(n)
     }
 
     /// Upload a file to the HubSpot Design Manager (create and update are the
@@ -2391,7 +2434,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
         let _ = app; // HubSpot reports at completion, like the Shopify path.
@@ -2403,7 +2446,7 @@ impl TransferManager {
         self.checkpoint(id, size).await?;
         crate::remotefs::hubspot::write_file(&session, remote_path, &data).await?;
         self.update(id, |t| t.transferred = size).await;
-        Ok(())
+        Ok(size)
     }
 
     /// Download a Dataverse web resource. The Web API answers with the whole
@@ -2416,7 +2459,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
         let _ = app; // single-shot API: progress is reported at completion.
@@ -2428,8 +2471,14 @@ impl TransferManager {
             .with_context(|| format!("create {}", local_path.display()))?;
         file.write_all(&data).await?;
         file.flush().await?;
-        self.update(id, |t| t.transferred = data.len() as u64).await;
-        Ok(())
+        // The listing's size is advisory for these APIs; the body is the truth.
+        let n = data.len() as u64;
+        self.update(id, |t| {
+            t.size = n;
+            t.transferred = n;
+        })
+        .await;
+        Ok(n)
     }
 
     /// Upload a file as a Dataverse web resource (create or update by name
@@ -2441,7 +2490,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
         let _ = app; // Dynamics reports at completion, like the HubSpot path.
@@ -2453,7 +2502,7 @@ impl TransferManager {
         self.checkpoint(id, size).await?;
         crate::remotefs::dynamics::write_file(&session, remote_path, &data).await?;
         self.update(id, |t| t.transferred = size).await;
-        Ok(())
+        Ok(size)
     }
 
     /// Stream a OneDrive download: GET the item's `/content` (Graph 302s to a
@@ -2465,7 +2514,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use futures::StreamExt;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -2495,7 +2544,7 @@ impl TransferManager {
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
-        Ok(())
+        Ok(transferred)
     }
 
     /// Upload to OneDrive: a single `PUT …/content` for small files, or a
@@ -2507,7 +2556,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
 
@@ -2530,7 +2579,7 @@ impl TransferManager {
                 .await?;
         }
         self.update(id, |t| t.transferred = size).await;
-        Ok(())
+        Ok(size)
     }
 
     async fn onedrive_simple_upload(
@@ -2656,7 +2705,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use futures::StreamExt;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -2691,7 +2740,7 @@ impl TransferManager {
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
-        Ok(())
+        Ok(transferred)
     }
 
     /// Upload to Google Drive: update the existing file's media if a same-named
@@ -2703,7 +2752,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         _app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use crate::session::gdrive::{basename, normalize, parent_of};
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -2773,7 +2822,7 @@ impl TransferManager {
         }
         session.clear_cache();
         self.update(id, |t| t.transferred = size).await;
-        Ok(())
+        Ok(size)
     }
 
     /// Stream a Box download: resolve the path to a file id, GET `/files/{id}/content`.
@@ -2784,7 +2833,7 @@ impl TransferManager {
         remote_path: &str,
         local_path: &Path,
         app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use futures::StreamExt;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -2819,7 +2868,7 @@ impl TransferManager {
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
-        Ok(())
+        Ok(transferred)
     }
 
     /// Upload to Box via multipart/form-data: a new file (`/files/content` with
@@ -2831,7 +2880,7 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         _app: &AppHandle,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use crate::session::boxdrive::{basename, normalize, parent_of};
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -2882,7 +2931,55 @@ impl TransferManager {
         }
         session.clear_cache();
         self.update(id, |t| t.transferred = size).await;
-        Ok(())
+        Ok(size)
+    }
+}
+
+/// Owns an in-progress object-store multipart upload and aborts it unless
+/// it completes. Dropping the guard (error, cancel, task abort) spawns a
+/// best-effort `abort()` so the store discards the uploaded parts; S3 and GCS
+/// would otherwise keep billing for them until a lifecycle rule runs.
+struct MultipartGuard {
+    upload: Option<Box<dyn object_store::MultipartUpload>>,
+    key: String,
+}
+
+impl MultipartGuard {
+    fn new(upload: Box<dyn object_store::MultipartUpload>, key: String) -> Self {
+        Self {
+            upload: Some(upload),
+            key,
+        }
+    }
+
+    fn get(&mut self) -> &mut Box<dyn object_store::MultipartUpload> {
+        self.upload.as_mut().expect("multipart upload already finished")
+    }
+
+    /// Complete the upload; on failure the guard's drop aborts it.
+    async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+        let res = self.get().complete().await;
+        if res.is_ok() {
+            self.upload = None;
+        }
+        res
+    }
+}
+
+impl Drop for MultipartGuard {
+    fn drop(&mut self) {
+        let Some(mut upload) = self.upload.take() else {
+            return;
+        };
+        let key = std::mem::take(&mut self.key);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                match upload.abort().await {
+                    Ok(()) => tracing::info!("aborted unfinished multipart upload {key}"),
+                    Err(e) => tracing::warn!("abort multipart upload {key}: {e}"),
+                }
+            });
+        }
     }
 }
 
@@ -3273,94 +3370,62 @@ fn is_transient(e: &anyhow::Error) -> bool {
     )
 }
 
-/// Shared download runner (Plan 17): admission → run loop → finalize → wake
-/// the queue. The loop re-runs the file from byte 0 after a resume-from-pause
-/// (Phase 2) and auto-retries transient errors with 5s/20s backoff (Phase 3).
-/// The concurrency permit is held through backoff — a deliberate trade-off so
-/// a retrying transfer keeps its slot.
-async fn run_download_task(
-    mgr: Arc<TransferManager>,
-    id: String,
-    session: Arc<Session>,
-    remote_path: String,
-    final_path: PathBuf,
-    app: AppHandle,
-) {
-    let Some(_permit) = mgr.admit(&id).await else {
-        return;
-    };
+/// Shared runner (Plan 17, Plan 24): admission → attempt loop → finalize →
+/// wake the queue. A pause gives the concurrency slot back and re-enters
+/// admission (Plan 24 Phase 1); transient errors auto-retry with 5s/20s
+/// backoff while keeping the slot.
+async fn run_job(mgr: Arc<TransferManager>, id: String, job: RetryInfo) {
     let mut auto_retries = 0u32;
-    let res = loop {
-        let attempt = dispatch_download(&mgr, &id, &session, &remote_path, &final_path, &app).await;
-        match attempt {
-            Err(e) if e.downcast_ref::<RestartFromPause>().is_some() => {
-                mgr.update(&id, |t| t.transferred = 0).await;
-                continue;
-            }
-            Err(e) if auto_retries < MAX_AUTO_RETRIES && is_transient(&e) => {
-                auto_retries += 1;
-                let delay = if auto_retries == 1 { 5 } else { 20 };
-                mgr.update(&id, |t| {
-                    t.transferred = 0;
-                    t.retry_attempt = Some(auto_retries);
-                    t.error = Some(format!("retrying in {delay}s (attempt {}/3)", auto_retries + 1));
-                })
-                .await;
-                if let Some(t) = mgr.get(&id).await {
-                    let _ = app.emit("transfer://updated", &t);
+    let res = 'admit: loop {
+        let Some(permit) = mgr.admit(&id).await else {
+            return;
+        };
+        loop {
+            let attempt = match &job {
+                RetryInfo::Download {
+                    session,
+                    remote_path,
+                    final_path,
+                } => dispatch_download(&mgr, &id, session, remote_path, final_path).await,
+                RetryInfo::Upload {
+                    session,
+                    local,
+                    final_remote,
+                } => dispatch_upload(&mgr, &id, session, local, final_remote).await,
+                #[cfg(test)]
+                RetryInfo::Test(f) => f(Arc::clone(&mgr), id.clone()).await,
+            };
+            match attempt {
+                Err(e) if is_paused(&e) => {
+                    drop(permit);
+                    mgr.requeue_paused(&id).await;
+                    continue 'admit;
                 }
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-                mgr.update(&id, |t| t.error = None).await;
-                continue;
+                Err(e) if auto_retries < MAX_AUTO_RETRIES && is_transient(&e) => {
+                    auto_retries += 1;
+                    let delay = if auto_retries == 1 { 5 } else { 20 };
+                    mgr.update(&id, |t| {
+                        t.transferred = 0;
+                        t.retry_attempt = Some(auto_retries);
+                        t.error = Some(format!(
+                            "retrying in {delay}s (attempt {}/3)",
+                            auto_retries + 1
+                        ));
+                    })
+                    .await;
+                    if let Some(t) = mgr.get(&id).await {
+                        mgr.emit("transfer://updated", &t);
+                    }
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    mgr.update(&id, |t| t.error = None).await;
+                    continue;
+                }
+                other => break 'admit other,
             }
-            other => break other,
         }
     };
-    finalize(&mgr, &id, &app, res).await;
-    mgr.bump_queue(&app).await;
-}
-
-/// Upload twin of `run_download_task`.
-async fn run_upload_task(
-    mgr: Arc<TransferManager>,
-    id: String,
-    session: Arc<Session>,
-    local: PathBuf,
-    final_remote: String,
-    app: AppHandle,
-) {
-    let Some(_permit) = mgr.admit(&id).await else {
-        return;
-    };
-    let mut auto_retries = 0u32;
-    let res = loop {
-        let attempt = dispatch_upload(&mgr, &id, &session, &local, &final_remote, &app).await;
-        match attempt {
-            Err(e) if e.downcast_ref::<RestartFromPause>().is_some() => {
-                mgr.update(&id, |t| t.transferred = 0).await;
-                continue;
-            }
-            Err(e) if auto_retries < MAX_AUTO_RETRIES && is_transient(&e) => {
-                auto_retries += 1;
-                let delay = if auto_retries == 1 { 5 } else { 20 };
-                mgr.update(&id, |t| {
-                    t.transferred = 0;
-                    t.retry_attempt = Some(auto_retries);
-                    t.error = Some(format!("retrying in {delay}s (attempt {}/3)", auto_retries + 1));
-                })
-                .await;
-                if let Some(t) = mgr.get(&id).await {
-                    let _ = app.emit("transfer://updated", &t);
-                }
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-                mgr.update(&id, |t| t.error = None).await;
-                continue;
-            }
-            other => break other,
-        }
-    };
-    finalize(&mgr, &id, &app, res).await;
-    mgr.bump_queue(&app).await;
+    finalize(&mgr, &id, res).await;
+    mgr.bump_queue_quiet().await;
 }
 
 /// Backend dispatch for a single-file download. Extracted so the runner (and
@@ -3371,8 +3436,11 @@ async fn dispatch_download(
     session: &Arc<Session>,
     remote_path: &str,
     final_path: &Path,
-    app: &AppHandle,
-) -> Result<()> {
+) -> Result<u64> {
+    let app = mgr
+        .app
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("transfer manager has no app handle"))?;
     match &**session {
         Session::Ssh(ssh) => {
             mgr.run_ssh_download(id, ssh.clone(), remote_path, final_path, app)
@@ -3437,8 +3505,11 @@ async fn dispatch_upload(
     session: &Arc<Session>,
     local: &Path,
     final_remote: &str,
-    app: &AppHandle,
-) -> Result<()> {
+) -> Result<u64> {
+    let app = mgr
+        .app
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("transfer manager has no app handle"))?;
     match &**session {
         Session::Ssh(ssh) => {
             mgr.run_ssh_upload(id, ssh.clone(), local, final_remote, app)
@@ -3495,21 +3566,36 @@ async fn dispatch_upload(
     }
 }
 
-async fn finalize(
-    mgr: &Arc<TransferManager>,
-    id: &str,
-    app: &AppHandle,
-    result: Result<()>,
-) {
+/// Settle a finished run. Success needs the bytes actually written to match
+/// the size known at enqueue (Plan 24 Phase 1) — a short copy is an error,
+/// never "done". A size that was unknown at enqueue (0) takes the written
+/// count.
+async fn finalize(mgr: &Arc<TransferManager>, id: &str, result: Result<u64>) {
+    let result = match result {
+        Ok(written) => {
+            let expected = mgr.get(id).await.map(|t| t.size).unwrap_or(0);
+            if expected == 0 || written == expected {
+                Ok(written)
+            } else {
+                Err(anyhow::anyhow!(
+                    "size mismatch: expected {expected} bytes, transferred {written}                      (the file changed or the connection dropped mid-transfer)"
+                ))
+            }
+        }
+        Err(e) => Err(e),
+    };
     match result {
-        Ok(()) => {
+        Ok(written) => {
             mgr.update(id, |t| {
                 t.status = TransferStatus::Done;
-                t.transferred = t.size;
+                t.size = written;
+                t.transferred = written;
+                t.error = None;
+                t.retry_attempt = None;
             })
             .await;
             if let Some(t) = mgr.get(id).await {
-                let _ = app.emit("transfer://done", &t);
+                mgr.emit("transfer://done", &t);
             }
         }
         Err(e) => {
@@ -3519,7 +3605,7 @@ async fn finalize(
             })
             .await;
             if let Some(t) = mgr.get(id).await {
-                let _ = app.emit("transfer://error", &t);
+                mgr.emit("transfer://error", &t);
             }
         }
     }
@@ -3561,40 +3647,156 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(100));
     }
 
-    // ---------- PauseGate + checkpoint (Phase 2) ----------
+    // ---------- checkpoint + pause releasing the slot (Plan 24 Phase 1) ----------
 
     #[tokio::test]
-    async fn pause_gate_parks_until_opened() {
-        let gate = PauseGate::new();
-        gate.set(true);
-        let g2 = gate.clone();
-        let handle = tokio::spawn(async move { g2.wait_open().await });
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!handle.is_finished());
-        gate.set(false);
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn checkpoint_parks_then_signals_restart() {
+    async fn checkpoint_fails_fast_when_paused() {
         let mgr = Arc::new(TransferManager::new());
         mgr.pauses.lock().await.insert("t1".into(), PauseGate::new());
         // Not paused → passes straight through.
         mgr.checkpoint("t1", 128).await.unwrap();
-
+        // Paused → returns at once (no parking while holding a slot).
         mgr.pauses.lock().await.get("t1").unwrap().set(true);
-        let m2 = Arc::clone(&mgr);
-        let handle = tokio::spawn(async move { m2.checkpoint("t1", 128).await });
-        // The parked task cannot finish before the gate opens (Ok needs an
-        // open gate, Err needs the park loop to break) — so a finished handle
-        // here is impossible regardless of scheduling.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!handle.is_finished());
+        let err = mgr.checkpoint("t1", 128).await.unwrap_err();
+        assert!(is_paused(&err));
+        // Pause-all trips it too.
         mgr.pauses.lock().await.get("t1").unwrap().set(false);
-        let err = handle.await.unwrap().unwrap_err();
-        assert!(err.downcast_ref::<RestartFromPause>().is_some());
+        mgr.pause_all.set(true);
+        assert!(is_paused(&mgr.checkpoint("t1", 0).await.unwrap_err()));
+    }
+
+    /// Register a queued row + gate + a fake copy loop that runs until its
+    /// checkpoint trips (pause) or `release` flips.
+    async fn spawn_fake(
+        mgr: &Arc<TransferManager>,
+        id: &str,
+        release: Arc<AtomicBool>,
+        running: Arc<AtomicUsize>,
+    ) {
+        mgr.insert(Transfer {
+            id: id.into(),
+            kind: TransferKind::Download,
+            source: id.into(),
+            destination: id.into(),
+            size: 10,
+            transferred: 0,
+            status: TransferStatus::Queued,
+            error: None,
+            retry_attempt: None,
+            delta: None,
+            started_at: 0,
+            resumable: false,
+        })
+        .await;
+        mgr.pauses.lock().await.insert(id.into(), PauseGate::new());
+        mgr.waiting.lock().await.push_back(id.into());
+        let job = RetryInfo::Test(Arc::new(move |mgr: Arc<TransferManager>, id: String| {
+            let release = release.clone();
+            let running = running.clone();
+            Box::pin(async move {
+                mgr.update(&id, |t| t.status = TransferStatus::Transferring).await;
+                running.fetch_add(1, Ordering::SeqCst);
+                let res = loop {
+                    if let Err(e) = mgr.checkpoint(&id, 1).await {
+                        break Err(e);
+                    }
+                    if release.load(Ordering::SeqCst) {
+                        break Ok(10);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+                running.fetch_sub(1, Ordering::SeqCst);
+                res
+            })
+        }));
+        let task = tokio::spawn(run_job(Arc::clone(mgr), id.to_string(), job));
+        mgr.tasks.lock().await.insert(id.to_string(), task);
+    }
+
+    async fn wait_for(cond: impl Fn() -> bool) {
+        for _ in 0..400 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("condition never became true");
+    }
+
+    /// With 3 slots, pausing the 3 running transfers lets the 4th start, and
+    /// resuming them brings them back once slots free up.
+    #[tokio::test]
+    async fn pause_releases_the_concurrency_slot() {
+        let mgr = Arc::new(TransferManager::new());
+        let release = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicUsize::new(0));
+        for id in ["a", "b", "c", "d"] {
+            spawn_fake(&mgr, id, release.clone(), running.clone()).await;
+        }
+        let r = running.clone();
+        wait_for(move || r.load(Ordering::SeqCst) == 3).await;
+        assert_eq!(mgr.get("d").await.unwrap().status, TransferStatus::Queued);
+
+        for id in ["a", "b", "c"] {
+            mgr.pauses.lock().await.get(id).unwrap().set(true);
+        }
+        let m = Arc::clone(&mgr);
+        wait_for(move || {
+            m.transfers
+                .try_lock()
+                .map(|t| t.get("d").unwrap().status == TransferStatus::Transferring)
+                .unwrap_or(false)
+        })
+        .await;
+        for id in ["a", "b", "c"] {
+            assert_eq!(mgr.get(id).await.unwrap().status, TransferStatus::Paused);
+            assert!(mgr.waiting.lock().await.iter().any(|x| x == id));
+        }
+
+        // Resume everything and let all four finish.
+        for id in ["a", "b", "c"] {
+            mgr.pauses.lock().await.get(id).unwrap().set(false);
+        }
+        mgr.bump_queue_quiet().await;
+        release.store(true, Ordering::SeqCst);
+        let m = Arc::clone(&mgr);
+        wait_for(move || {
+            m.transfers
+                .try_lock()
+                .map(|t| t.values().all(|t| t.status == TransferStatus::Done))
+                .unwrap_or(false)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn short_transfer_is_an_error_not_done() {
+        let mgr = Arc::new(TransferManager::new());
+        for (id, size) in [("short", 100u64), ("unknown", 0)] {
+            mgr.insert(Transfer {
+                id: id.into(),
+                kind: TransferKind::Download,
+                source: id.into(),
+                destination: id.into(),
+                size,
+                transferred: 0,
+                status: TransferStatus::Transferring,
+                error: None,
+                retry_attempt: None,
+                delta: None,
+                started_at: 0,
+                resumable: false,
+            })
+            .await;
+        }
+        finalize(&mgr, "short", Ok(60)).await;
+        let t = mgr.get("short").await.unwrap();
+        assert_eq!(t.status, TransferStatus::Error);
+        assert!(t.error.unwrap().contains("size mismatch"));
+        // Unknown size at enqueue: the written count becomes the size.
+        finalize(&mgr, "unknown", Ok(42)).await;
+        let t = mgr.get("unknown").await.unwrap();
+        assert_eq!((t.status, t.size, t.transferred), (TransferStatus::Done, 42, 42));
     }
 
     // ---------- FIFO admission (Phase 1) ----------

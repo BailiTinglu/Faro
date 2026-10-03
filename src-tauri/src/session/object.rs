@@ -3,8 +3,9 @@ use anyhow::{anyhow, Context, Result};
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
-use object_store::ObjectStore;
+use object_store::{ClientOptions, ObjectStore};
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// A blob/object-store session. The same struct backs every cloud object
@@ -18,6 +19,20 @@ pub struct ObjectSession {
     /// Bucket (S3) or container (Azure). Surfaced for path-bar display.
     pub container: String,
     pub store: Arc<dyn ObjectStore>,
+}
+
+/// HTTP client options shared by every object-store backend (Plan 24).
+///
+/// object_store's default 30 s request timeout runs "until the response body
+/// has finished", so any GET or part upload that takes longer than 30 s fails
+/// and restarts from byte 0. Transfers get no whole-request timeout instead,
+/// and the transfer engine's stall watchdog aborts a connection that stops
+/// moving bytes. Connecting keeps a short timeout so a dead endpoint fails
+/// fast. object_store's own `RetryConfig` stays at its defaults.
+fn client_options() -> ClientOptions {
+    ClientOptions::new()
+        .with_connect_timeout(Duration::from_secs(10))
+        .with_timeout_disabled()
 }
 
 pub async fn object_connect(profile: &ConnectionProfile) -> Result<ObjectSession> {
@@ -54,7 +69,8 @@ async fn s3_connect(profile: &ConnectionProfile) -> Result<ObjectSession> {
         .with_bucket_name(&bucket)
         .with_access_key_id(&access_key)
         .with_secret_access_key(&secret_key)
-        .with_region(&region);
+        .with_region(&region)
+        .with_client_options(client_options());
 
     if let Some(endpoint) = profile.endpoint.as_ref().filter(|s| !s.is_empty()) {
         builder = builder.with_endpoint(endpoint);
@@ -107,7 +123,8 @@ async fn azure_connect(profile: &ConnectionProfile) -> Result<ObjectSession> {
     let mut builder = MicrosoftAzureBuilder::new()
         .with_account(&account)
         .with_container_name(&container)
-        .with_access_key(&access_key);
+        .with_access_key(&access_key)
+        .with_client_options(client_options());
 
     if let Some(endpoint) = profile.endpoint.as_ref().filter(|s| !s.is_empty()) {
         builder = builder.with_endpoint(endpoint.clone());
@@ -137,7 +154,9 @@ async fn gcs_connect(profile: &ConnectionProfile) -> Result<ObjectSession> {
         .ok_or_else(|| anyhow!("GCS profile is missing the bucket name"))?
         .clone();
 
-    let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(&bucket);
+    let mut builder = GoogleCloudStorageBuilder::new()
+        .with_bucket_name(&bucket)
+        .with_client_options(client_options());
 
     match &profile.auth {
         AuthMethod::Key { path, .. } => {

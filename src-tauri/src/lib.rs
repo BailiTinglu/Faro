@@ -262,6 +262,7 @@ pub fn run() {
             // those values.
             {
                 let st = app.state::<AppState>();
+                st.transfers.set_app(app.handle());
                 if let Ok(Some(raw)) = st.db.settings_get("transferConcurrency") {
                     if let Ok(n) = serde_json::from_str::<usize>(&raw) {
                         st.transfers.set_concurrency(n);
