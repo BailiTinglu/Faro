@@ -113,6 +113,18 @@ impl FtpStreamKind {
     ) -> Result<u64> {
         each!(self, s => s.put_file(path, reader).map_err(into_anyhow))
     }
+    /// `APPE`: append `reader` to the remote file (resumed uploads).
+    pub fn append_from_reader<R: std::io::Read>(
+        &mut self,
+        path: &str,
+        reader: &mut R,
+    ) -> Result<u64> {
+        each!(self, s => s.append_file(path, reader).map_err(into_anyhow))
+    }
+    /// `REST <offset>`: make the next `RETR` start `offset` bytes in.
+    pub fn restart_at(&mut self, offset: u64) -> Result<()> {
+        each!(self, s => s.resume_transfer(offset as usize).map_err(into_anyhow))
+    }
     pub fn set_text_codec(&mut self, codec: Option<TextCodec>) {
         each!(self, s => s.set_text_codec(codec))
     }
@@ -447,6 +459,12 @@ fn connect_blocking(
         stream.set_text_codec(Some(fixed_codec(enc)));
     }
     stream.login(&profile.username, password)?;
+    // RFC 959's default type is ASCII, in which ProFTPD, IIS and others
+    // rewrite line endings (corrupting binaries) and refuse SIZE. Everything
+    // Faro moves is bytes.
+    each!(&mut stream, s => s.transfer_type(suppaftp::types::FileType::Binary))
+        .map_err(into_anyhow)
+        .context("FTP TYPE I")?;
 
     let features = stream.features();
     let has = |f: &str| features.iter().any(|k| k == f);
