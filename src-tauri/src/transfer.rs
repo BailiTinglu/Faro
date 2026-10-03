@@ -1838,17 +1838,15 @@ impl TransferManager {
                 0
             };
             file.seek(SeekFrom::Start(start))?;
-            gate.start(start)?;
             let mut reader = GatedReader {
                 inner: std::io::BufReader::new(file),
                 gate,
                 pending: 0,
             };
-            if start > 0 {
-                stream.append_from_reader(&remote, &mut reader)?;
-            } else {
-                stream.put_from_reader(&remote, &mut reader)?;
-            }
+            // Mark the transfer resumable only once STOR/APPE is accepted: if
+            // the server refuses it, whatever already sits at `remote` is not
+            // ours and a retry must not append to it.
+            stream.upload(&remote, start > 0, &mut reader, |r| r.gate.start(start))?;
             reader.finish()?;
             Ok(())
         });

@@ -19,14 +19,15 @@ use super::Status;
 /// command. A codec lets the caller translate both directions losslessly.
 #[derive(Clone)]
 pub struct TextCodec {
-    encode: std::sync::Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>,
+    encode: std::sync::Arc<dyn Fn(&str) -> Result<Vec<u8>, String> + Send + Sync>,
     decode: std::sync::Arc<dyn Fn(&[u8]) -> String + Send + Sync>,
 }
 
 impl TextCodec {
-    /// Build a codec from an encoder (text -> wire bytes) and a decoder.
+    /// Build a codec from an encoder (text -> wire bytes, or why the text
+    /// can't be represented) and a decoder.
     pub fn new(
-        encode: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
+        encode: impl Fn(&str) -> Result<Vec<u8>, String> + Send + Sync + 'static,
         decode: impl Fn(&[u8]) -> String + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -35,8 +36,9 @@ impl TextCodec {
         }
     }
 
-    /// Encode `text` to wire bytes.
-    pub fn encode_text(&self, text: &str) -> Vec<u8> {
+    /// Encode `text` to wire bytes. Fails rather than substituting characters
+    /// the charset can't represent, which would address a different path.
+    pub fn encode_text(&self, text: &str) -> Result<Vec<u8>, String> {
         (self.encode)(text)
     }
 
@@ -61,6 +63,10 @@ pub enum FtpError {
     #[cfg_attr(docsrs, doc(cfg(feature = "async-secure")))]
     #[error("Secure error: {0}")]
     SecureError(String),
+    /// Faro patch: a command couldn't be represented in the stream's
+    /// `TextCodec` charset, so it was not sent.
+    #[error("{0}")]
+    TextEncoding(String),
     /// Unexpected response from remote. The command expected a certain response, but got another one.
     /// This means the ftp server refused to perform your request or there was an error while processing it.
     /// Contains the response data.

@@ -17,7 +17,9 @@ has a hook for this.
 ## The patch (sync client only)
 
 - `types::TextCodec`: an encoder/decoder pair (`encode_text`,
-  `decode_text`), exported from the crate root.
+  `decode_text`), exported from the crate root. Encoding is fallible: text
+  the charset can't represent fails with the new `FtpError::TextEncoding`
+  instead of being substituted, which would address a different path.
 - `ImplFtpStream::set_text_codec(Option<TextCodec>)`: when set, `perform`
   encodes each command with it, and `LIST`/`NLST`/`MLSD` lines, `PWD` and
   `MLST` replies are decoded with it. The codec carries over through

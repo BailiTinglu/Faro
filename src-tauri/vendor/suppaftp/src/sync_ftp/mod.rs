@@ -890,7 +890,7 @@ where
         trace!("CC OUT: {}", command.trim_end_matches("\r\n"));
 
         let bytes = match &self.codec {
-            Some(codec) => codec.encode_text(&command),
+            Some(codec) => codec.encode_text(&command).map_err(FtpError::TextEncoding)?,
             None => command.into_bytes(),
         };
         let stream = self.reader.get_mut();

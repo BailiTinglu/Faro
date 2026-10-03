@@ -113,13 +113,32 @@ impl FtpStreamKind {
     ) -> Result<u64> {
         each!(self, s => s.put_file(path, reader).map_err(into_anyhow))
     }
-    /// `APPE`: append `reader` to the remote file (resumed uploads).
-    pub fn append_from_reader<R: std::io::Read>(
+    /// Upload `reader` with `STOR`, or `APPE` when `append` (resumed
+    /// uploads). `on_open` runs once the server has accepted the command and
+    /// opened the data connection, i.e. once the remote file is really this
+    /// upload's; a refused command never reaches it.
+    pub fn upload<R: std::io::Read>(
         &mut self,
         path: &str,
+        append: bool,
         reader: &mut R,
+        on_open: impl FnOnce(&mut R) -> std::io::Result<()>,
     ) -> Result<u64> {
-        each!(self, s => s.append_file(path, reader).map_err(into_anyhow))
+        each!(self, s => {
+            let mut data = if append {
+                s.append_with_stream(path)
+            } else {
+                s.put_with_stream(path)
+            }
+            .map_err(into_anyhow)?;
+            // A copy cut short leaves the control channel mid-transfer, so
+            // report it as a connection error (the session reconnects).
+            let copied = on_open(reader)
+                .and_then(|_| std::io::copy(reader, &mut data))
+                .map_err(|e| into_anyhow(FtpError::ConnectionError(e)))?;
+            s.finalize_put_stream(data).map_err(into_anyhow)?;
+            Ok(copied)
+        })
     }
     /// `REST <offset>`: make the next `RETR` start `offset` bytes in.
     pub fn restart_at(&mut self, offset: u64) -> Result<()> {
@@ -196,9 +215,29 @@ fn resolve_charset(setting: Option<&str>) -> Result<Charset> {
     }
 }
 
+/// Encode `text` in `enc`, refusing characters it can't represent.
+/// `encoding_rs` would substitute an HTML numeric reference (`☃` ->
+/// `&#9731;`), so the command would silently create or address a
+/// different file.
+fn encode_strict(enc: &'static Encoding, text: &str) -> Result<Vec<u8>, String> {
+    let (bytes, _, unmappable) = enc.encode(text);
+    if !unmappable {
+        return Ok(bytes.into_owned());
+    }
+    let mut buf = [0u8; 4];
+    let bad = text
+        .chars()
+        .find(|c| enc.encode(c.encode_utf8(&mut buf)).2)
+        .unwrap_or('?');
+    Err(format!(
+        "\"{bad}\" can't be written in {}; pick a different character set for this connection",
+        enc.name()
+    ))
+}
+
 fn fixed_codec(enc: &'static Encoding) -> TextCodec {
     TextCodec::new(
-        move |text| enc.encode(text).0.into_owned(),
+        move |text| encode_strict(enc, text),
         move |bytes| enc.decode_without_bom_handling(bytes).0.into_owned(),
     )
 }
@@ -225,9 +264,9 @@ fn auto_codec(host: String, state: Arc<AtomicU8>) -> TextCodec {
     TextCodec::new(
         move |text| {
             if enc_state.load(Ordering::Relaxed) == DETECTED_LEGACY {
-                WINDOWS_1252.encode(text).0.into_owned()
+                encode_strict(WINDOWS_1252, text)
             } else {
-                text.as_bytes().to_vec()
+                Ok(text.as_bytes().to_vec())
             }
         },
         move |bytes| {
@@ -710,15 +749,18 @@ mod tests {
         let codec = auto_codec("test".into(), state.clone());
         // ASCII settles nothing; commands go out as UTF-8 meanwhile.
         assert_eq!(codec.decode_text(b"226 Transfer complete"), "226 Transfer complete");
-        assert_eq!(codec.encode_text("é"), "é".as_bytes());
+        assert_eq!(codec.encode_text("é").unwrap(), "é".as_bytes());
         // A Latin-1 listing line settles on Windows-1252...
         let line = b"-rw-r--r-- 1 ftp ftp 3 Jan 1 2024 caf\xe9.txt";
         assert!(codec.decode_text(line).ends_with("café.txt"));
         // ...so the same name is sent back as the server's original bytes,
-        assert_eq!(codec.encode_text("café.txt"), b"caf\xe9.txt");
+        assert_eq!(codec.encode_text("café.txt").unwrap(), b"caf\xe9.txt");
+        // Characters Windows-1252 lacks are refused, not turned into `&#…;`.
+        let err = codec.encode_text("STOR snow☃.txt").unwrap_err();
+        assert!(err.contains('☃') && err.contains("windows-1252"), "{err}");
         // and a codec rebuilt on reconnect keeps the verdict.
         let again = auto_codec("test".into(), state);
-        assert_eq!(again.encode_text("café.txt"), b"caf\xe9.txt");
+        assert_eq!(again.encode_text("café.txt").unwrap(), b"caf\xe9.txt");
     }
 
     #[test]
@@ -727,7 +769,7 @@ mod tests {
         assert_eq!(codec.decode_text("résumé.txt".as_bytes()), "résumé.txt");
         // One stray Latin-1 name later doesn't flip a UTF-8 server.
         assert_eq!(codec.decode_text(b"caf\xe9"), "caf\u{FFFD}");
-        assert_eq!(codec.encode_text("é"), "é".as_bytes());
+        assert_eq!(codec.encode_text("é☃").unwrap(), "é☃".as_bytes());
     }
 
     #[test]

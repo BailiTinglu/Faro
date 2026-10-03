@@ -141,7 +141,16 @@ fn parse_mlsd_time(v: &str) -> Option<i64> {
     let n = |r: std::ops::Range<usize>| digits[r].parse::<i64>().unwrap_or(0);
     let (y, mo, d) = (n(0..4), n(4..6), n(6..8));
     let (h, mi, s) = (n(8..10), n(10..12), n(12..14));
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let max_day = match mo {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return None,
+    };
+    // Second 60 is RFC 3659's leap second; it lands on the next minute.
+    if !(1..=max_day).contains(&d) || h > 23 || mi > 59 || s > 60 {
         return None;
     }
     // Days from the civil date (Howard Hinnant's algorithm).
@@ -360,6 +369,12 @@ mod tests {
         assert_eq!(l.kind, FileKind::Symlink);
 
         assert!(entry_from_mlsd("/", "type=cdir;modify=20240101000000; /www").is_none());
+
+        // Impossible dates are dropped rather than normalised into another day.
+        assert_eq!(parse_mlsd_time("20240231000000"), None);
+        assert_eq!(parse_mlsd_time("20230229000000"), None);
+        assert_eq!(parse_mlsd_time("20240229120000"), Some(1_709_208_000));
+        assert_eq!(parse_mlsd_time("20241301000000"), None);
         assert!(entry_from_mlsd("/", "type=pdir; ..").is_none());
     }
 
