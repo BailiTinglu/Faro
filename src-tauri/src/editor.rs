@@ -12,6 +12,8 @@
 //!   5. Frontend can call `stop_edit(edit_id)` to clean up; or the manager's
 //!      Drop tears down the watcher when the AppState goes away.
 
+#[cfg(windows)]
+use crate::proc::NoConsoleWindow;
 use crate::session::Session;
 use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -251,6 +253,7 @@ fn spawn_editor(path: &std::path::Path, editor: Option<&str>) -> Result<()> {
         std::process::Command::new("cmd")
             .args(["/c", cmd])
             .arg(path)
+            .no_console_window()
             .spawn()
             .with_context(|| format!("spawn editor `{cmd}` for {}", path.display()))?;
         return Ok(());
@@ -261,6 +264,7 @@ fn spawn_editor(path: &std::path::Path, editor: Option<&str>) -> Result<()> {
     std::process::Command::new("cmd")
         .args(["/c", "start", ""])
         .arg(path)
+        .no_console_window()
         .spawn()
         .with_context(|| format!("spawn editor for {}", path.display()))?;
     Ok(())
