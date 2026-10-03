@@ -190,6 +190,7 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
   const [autoConnect, setAutoConnect] = useState(profile?.autoConnect ?? false);
   // FTP-only: path-name character set ("" = auto).
   const [ftpEncoding, setFtpEncoding] = useState(seed?.ftpEncoding ?? "");
+  const [ftpActiveMode, setFtpActiveMode] = useState(seed?.ftpActiveMode ?? false);
   const [group, setGroup] = useState(seed?.group ?? "");
   // Custom rail bubble glyph: emoji/short string, or a bundled Iconify key
   // (picked via the IconPicker grid; custom keys still possible via search).
@@ -458,6 +459,7 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
       jumpPort: profile?.jumpPort,
       jumpUsername: profile?.jumpUsername,
       ftpEncoding: isFtp ? ftpEncoding || undefined : undefined,
+      ftpActiveMode: isFtp && ftpActiveMode ? true : undefined,
     };
   };
 
@@ -922,24 +924,37 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
         </Field>
 
         {isFtp && (
-          <Field label="Character set">
-            <select
-              value={ftpEncoding}
-              onChange={(e) => setFtpEncoding(e.target.value)}
-              className={inputCls}
-            >
-              {FTP_CHARSETS.map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-              {/* An imported/hand-edited label we don't list: keep it. */}
-              {ftpEncoding &&
-                !FTP_CHARSETS.some(([v]) => v === ftpEncoding) && (
-                  <option value={ftpEncoding}>{ftpEncoding}</option>
-                )}
-            </select>
-          </Field>
+          <div className="flex gap-3">
+            <Field label="Character set" className="min-w-0 flex-1">
+              <select
+                value={ftpEncoding}
+                onChange={(e) => setFtpEncoding(e.target.value)}
+                className={inputCls}
+              >
+                {FTP_CHARSETS.map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+                {/* An imported/hand-edited label we don't list: keep it. */}
+                {ftpEncoding &&
+                  !FTP_CHARSETS.some(([v]) => v === ftpEncoding) && (
+                    <option value={ftpEncoding}>{ftpEncoding}</option>
+                  )}
+              </select>
+            </Field>
+            <Field label="Transfer mode" className="w-40 shrink-0">
+              <select
+                value={ftpActiveMode ? "active" : "passive"}
+                onChange={(e) => setFtpActiveMode(e.target.value === "active")}
+                className={inputCls}
+                title="Passive works through home routers and most firewalls. Use active only when the server's passive ports are blocked."
+              >
+                <option value="passive">Passive</option>
+                <option value="active">Active</option>
+              </select>
+            </Field>
+          </div>
         )}
 
         <label className="mb-3 flex cursor-pointer items-center gap-2.5 rounded-md border border-border bg-bg-subtle px-2.5 py-2">

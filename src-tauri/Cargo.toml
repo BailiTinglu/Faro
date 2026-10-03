@@ -80,7 +80,11 @@ mdns-sd = "0.11"
 vela-companion = { git = "https://github.com/jhd3197/vela-companion" }
 
 # FTP / FTPS — sync API, driven from tokio via spawn_blocking.
-suppaftp = { version = "6", features = ["native-tls"] }
+# rustls is the default FTPS stack (TLS session reuse across the control and
+# data connections); native-tls stays as the fallback for TLS 1.0/1.1 servers.
+suppaftp = { version = "6", features = ["native-tls", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-platform-verifier = "0.7"
 # FTP charset support (non-UTF-8 servers): see session/ftp.rs.
 encoding_rs = "0.8"
 

@@ -10,8 +10,8 @@ import { useDialog } from "@/hooks/useDialog";
 import type { HostDecision, HostPromptEvent } from "@/lib/types";
 
 // Mounted once at the top of the tree. Listens for `host://prompt` events
-// from the SSH connect handshake and shows the user the fingerprint of an
-// unknown or changed host key. Queues prompts in case the user is connecting
+// from the SSH connect handshake (and FTPS certificates the OS doesn't trust)
+// and shows the user the fingerprint of an unknown or changed key. Queues prompts in case the user is connecting
 // to several profiles quickly.
 export function HostKeyModal() {
   const [queue, setQueue] = useState<HostPromptEvent[]>([]);
@@ -48,6 +48,7 @@ function HostKeyDialog({
   onRespond: (d: HostDecision) => void;
 }) {
   const isMismatch = event.kind === "mismatch";
+  const isTls = event.tlsReason != null;
   const panelRef = useRef<HTMLDivElement>(null);
   const rejectRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
@@ -84,7 +85,13 @@ function HostKeyDialog({
           </div>
           <div className="min-w-0 flex-1">
             <div id={titleId} className="text-[13px] font-semibold">
-              {isMismatch ? "Host key has changed" : "Unknown host"}
+              {isTls
+                ? isMismatch
+                  ? "Certificate has changed"
+                  : "Untrusted certificate"
+                : isMismatch
+                  ? "Host key has changed"
+                  : "Unknown host"}
             </div>
             <div className="truncate font-mono text-[11px] text-text-dim">
               {event.host}:{event.port}
@@ -100,7 +107,26 @@ function HostKeyDialog({
         </div>
 
         <div className="px-4 py-4">
-          {isMismatch ? (
+          {isTls ? (
+            <p className="mb-3 text-[12.5px] leading-relaxed text-text-muted">
+              {isMismatch ? (
+                <>
+                  The server presented a different TLS certificate from the one
+                  you trusted before, and your system doesn't trust it either (
+                  {event.tlsReason}). It may have been renewed — or someone may be
+                  intercepting the connection. Verify with the host operator
+                  before continuing.
+                </>
+              ) : (
+                <>
+                  Your system doesn't trust this server's TLS certificate: it is{" "}
+                  {event.tlsReason}. That's common for NAS boxes and servers with a
+                  self-signed certificate. Check the fingerprint against what the
+                  server operator gave you before trusting it.
+                </>
+              )}
+            </p>
+          ) : isMismatch ? (
             <p className="mb-3 text-[12.5px] leading-relaxed text-text-muted">
               The server presented a host key that does <strong>not</strong>{" "}
               match the one previously recorded in <code>~/.ssh/known_hosts</code>.
@@ -121,6 +147,7 @@ function HostKeyDialog({
             keyType={event.keyType}
             fingerprint={event.fingerprint}
             tone={isMismatch ? "danger" : "neutral"}
+            wrap={isTls}
           />
           {isMismatch && event.storedFingerprint && (
             <FingerprintRow
@@ -128,6 +155,7 @@ function HostKeyDialog({
               keyType={event.keyType}
               fingerprint={event.storedFingerprint}
               tone="neutral"
+              wrap={isTls}
             />
           )}
         </div>
@@ -167,11 +195,14 @@ function FingerprintRow({
   keyType,
   fingerprint,
   tone,
+  wrap,
 }: {
   label: string;
   keyType: string;
   fingerprint: string;
   tone: "neutral" | "danger";
+  /** Long (certificate) fingerprints wrap instead of truncating. */
+  wrap?: boolean;
 }) {
   return (
     <div className="mb-2 flex items-center gap-2 rounded-md border border-border bg-bg-subtle px-2.5 py-2 last:mb-0">
@@ -183,7 +214,9 @@ function FingerprintRow({
         <div className="text-[10px] font-medium uppercase tracking-wider text-text-dim">
           {label} · {keyType}
         </div>
-        <div className="selectable truncate font-mono text-[11px]">
+        <div
+          className={`selectable font-mono text-[11px] ${wrap ? "break-all" : "truncate"}`}
+        >
           {fingerprint}
         </div>
       </div>

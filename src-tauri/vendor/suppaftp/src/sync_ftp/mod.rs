@@ -909,7 +909,15 @@ where
                     let start = Instant::now();
                     loop {
                         match listener.accept() {
-                            Ok((stream, _)) => break Ok(stream),
+                            // Faro patch: on Windows an accepted socket inherits the
+                            // listener's non-blocking mode, and the blocking reads that
+                            // follow fail with WouldBlock. Make it blocking explicitly.
+                            Ok((stream, _)) => {
+                                break stream
+                                    .set_nonblocking(false)
+                                    .map(|_| stream)
+                                    .map_err(FtpError::ConnectionError);
+                            }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 if start.elapsed() > self.active_timeout {
                                     break Err(FtpError::ConnectionError(

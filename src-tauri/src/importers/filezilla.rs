@@ -142,6 +142,7 @@ struct ServerAccum {
     user: Option<String>,
     encoding_type: Option<String>,
     custom_encoding: Option<String>,
+    pasv_mode: Option<String>,
 }
 
 impl ServerAccum {
@@ -157,6 +158,7 @@ impl ServerAccum {
             "User" => self.user = Some(value.to_string()),
             "EncodingType" => self.encoding_type = Some(value.to_string()),
             "CustomEncoding" => self.custom_encoding = Some(value.to_string()),
+            "PasvMode" => self.pasv_mode = Some(value.to_string()),
             _ => {}
         }
     }
@@ -188,6 +190,8 @@ impl ServerAccum {
                 Some(t) if t.eq_ignore_ascii_case("Custom") => self.custom_encoding,
                 _ => None,
             };
+            // MODE_DEFAULT / MODE_PASSIVE / MODE_ACTIVE.
+            p.ftp_active_mode = (self.pasv_mode.as_deref() == Some("MODE_ACTIVE")).then_some(true);
         }
         let breadcrumb = folder_stack
             .iter()
@@ -214,9 +218,20 @@ mod tests {
 <FileZilla3><Servers>
   <Server><Host>a.example</Host><Protocol>0</Protocol><EncodingType>Custom</EncodingType><CustomEncoding>ISO-8859-1</CustomEncoding><Name>a</Name></Server>
   <Server><Host>b.example</Host><Protocol>0</Protocol><EncodingType>UTF-8</EncodingType><Name>b</Name></Server>
-  <Server><Host>c.example</Host><Protocol>3</Protocol><EncodingType>Auto</EncodingType><Name>c</Name></Server>
+  <Server><Host>c.example</Host><Protocol>3</Protocol><EncodingType>Auto</EncodingType><PasvMode>MODE_ACTIVE</PasvMode><Name>c</Name></Server>
 </Servers></FileZilla3>"#;
-        let got: Vec<_> = parse(xml).unwrap().into_iter().map(|p| p.ftp_encoding).collect();
-        assert_eq!(got, vec![Some("ISO-8859-1".into()), Some("utf-8".into()), None]);
+        let got: Vec<_> = parse(xml)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.ftp_encoding, p.ftp_active_mode))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some("ISO-8859-1".into()), None),
+                (Some("utf-8".into()), None),
+                (None, Some(true)),
+            ]
+        );
     }
 }

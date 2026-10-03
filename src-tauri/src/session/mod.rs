@@ -64,6 +64,10 @@ pub struct HostPromptEvent {
     pub fingerprint: String,
     pub stored_fingerprint: Option<String>,
     pub kind: HostPromptKind,
+    /// Set when the prompt is about an FTPS certificate rather than an SSH
+    /// host key: why the OS trust store rejected it ("self-signed", ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
@@ -280,6 +284,23 @@ pub trait HostKeyVerifier: Send + Sync {
         stored_fingerprint: Option<&str>,
         kind: HostPromptKind,
     ) -> Result<HostDecision, russh::Error>;
+
+    /// Same decision for an FTPS server certificate the OS trust store
+    /// rejected (`reason` says why). Verifiers without a TLS-specific UI fall
+    /// back to the host-key prompt with the reason folded into the key type.
+    async fn decide_tls(
+        &self,
+        host: &str,
+        port: u16,
+        fingerprint: &str,
+        stored_fingerprint: Option<&str>,
+        kind: HostPromptKind,
+        reason: &str,
+    ) -> Result<HostDecision, russh::Error> {
+        let key_type = format!("TLS certificate, {reason}");
+        self.decide(host, port, &key_type, fingerprint, stored_fingerprint, kind)
+            .await
+    }
 }
 
 /// GUI verifier. Emits `host://prompt` and waits for the
@@ -292,6 +313,15 @@ pub struct TauriHostKeyVerifier {
 impl TauriHostKeyVerifier {
     pub fn new(app: AppHandle, prompts: Arc<HostPromptRegistry>) -> Self {
         Self { app, prompts }
+    }
+
+    async fn prompt(&self, mut event: HostPromptEvent) -> Result<HostDecision, russh::Error> {
+        let (request_id, rx) = self.prompts.register().await;
+        event.request_id = request_id;
+        if self.app.emit("host://prompt", event).is_err() {
+            return Err(russh::Error::HUP);
+        }
+        rx.await.map_err(|_| russh::Error::HUP)
     }
 }
 
@@ -306,20 +336,39 @@ impl HostKeyVerifier for TauriHostKeyVerifier {
         stored_fingerprint: Option<&str>,
         kind: HostPromptKind,
     ) -> Result<HostDecision, russh::Error> {
-        let (request_id, rx) = self.prompts.register().await;
-        let event = HostPromptEvent {
-            request_id,
+        self.prompt(HostPromptEvent {
+            request_id: String::new(),
             host: host.to_string(),
             port,
             key_type: key_type.to_string(),
             fingerprint: fingerprint.to_string(),
             stored_fingerprint: stored_fingerprint.map(|s| s.to_string()),
             kind,
-        };
-        if self.app.emit("host://prompt", event).is_err() {
-            return Err(russh::Error::HUP);
-        }
-        rx.await.map_err(|_| russh::Error::HUP)
+            tls_reason: None,
+        })
+        .await
+    }
+
+    async fn decide_tls(
+        &self,
+        host: &str,
+        port: u16,
+        fingerprint: &str,
+        stored_fingerprint: Option<&str>,
+        kind: HostPromptKind,
+        reason: &str,
+    ) -> Result<HostDecision, russh::Error> {
+        self.prompt(HostPromptEvent {
+            request_id: String::new(),
+            host: host.to_string(),
+            port,
+            key_type: "TLS certificate".to_string(),
+            fingerprint: fingerprint.to_string(),
+            stored_fingerprint: stored_fingerprint.map(|s| s.to_string()),
+            kind,
+            tls_reason: Some(reason.to_string()),
+        })
+        .await
     }
 }
 
@@ -1188,7 +1237,7 @@ pub async fn open_session(
             Ok(Session::Ssh(ssh))
         }
         "ftp" | "ftps" => {
-            let ftp = ftp_connect(profile).await?;
+            let ftp = ftp_connect(profile, verifier).await?;
             Ok(Session::Ftp(Arc::new(ftp)))
         }
         "s3" | "azure" | "gcs" => {
@@ -1691,7 +1740,7 @@ impl SessionManager {
                 (id, Session::Ssh(ssh))
             }
             "ftp" | "ftps" => {
-                let ftp = ftp_connect(&profile).await?;
+                let ftp = ftp_connect(&profile, verifier).await?;
                 let id = ftp.id.clone();
                 (id, Session::Ftp(Arc::new(ftp)))
             }

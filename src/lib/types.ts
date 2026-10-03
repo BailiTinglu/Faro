@@ -103,6 +103,8 @@ export interface ConnectionProfile {
    *  back to Windows-1252 when the server sends non-UTF-8 names); otherwise a
    *  WHATWG label like "windows-1252" or "shift_jis". */
   ftpEncoding?: string;
+  /** FTP/FTPS: open data connections in active (PORT) mode. Absent = passive. */
+  ftpActiveMode?: boolean;
 }
 
 export const PROTOCOL_DEFAULT_PORT: Record<Protocol, number> = {
@@ -310,6 +312,7 @@ export interface ProfilePreview {
   identityFile?: string;
   note?: string;
   ftpEncoding?: string;
+  ftpActiveMode?: boolean;
 }
 
 export type ImporterKind = "openssh" | "filezilla" | "putty";
@@ -857,6 +860,9 @@ export interface HostPromptEvent {
   fingerprint: string;
   storedFingerprint?: string | null;
   kind: HostPromptKind;
+  /** Present when the prompt is about an FTPS server certificate the OS
+   *  trust store rejected (rather than an SSH host key): the reason why. */
+  tlsReason?: string;
 }
 
 // ---- Keyboard-interactive auth (e.g. forced password change for a temp pw) ----

@@ -84,6 +84,10 @@ pub struct ConnectionProfile {
     // ("utf-8", "windows-1252", "shift_jis", "gbk", ...).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ftp_encoding: Option<String>,
+    // FTP/FTPS data connections in active (PORT) mode instead of passive.
+    // Absent = passive, which works through client-side NAT.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ftp_active_mode: Option<bool>,
 }
 
 // Plain JSON file in the app data dir. v0.2 moves secrets into the OS

@@ -23,6 +23,10 @@ has a hook for this.
   `MLST` replies are decoded with it. The codec carries over through
   `into_secure`.
 
+Also fixed: in active mode the accepted data socket is switched back to
+blocking. On Windows it inherits the listener's non-blocking mode, so every
+active-mode transfer failed with WouldBlock (surfacing as `BadResponse`).
+
 With no codec set, behaviour matches upstream byte for byte. To move to a
 newer suppaftp, re-apply these changes or drop the patch once upstream
 grows an equivalent.

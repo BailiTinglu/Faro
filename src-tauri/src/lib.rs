@@ -34,6 +34,7 @@ pub mod search;
 pub mod session;
 pub mod sync;
 mod terminal;
+mod tls_trust;
 mod transfer;
 mod vela;
 mod virtualfs;

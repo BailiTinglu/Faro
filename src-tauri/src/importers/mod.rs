@@ -34,6 +34,9 @@ pub struct ProfilePreview {
     /// per-site "Charset" setting). `None` means auto.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ftp_encoding: Option<String>,
+    /// FTP active (PORT) mode carried over from the source. `None` = passive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ftp_active_mode: Option<bool>,
 }
 
 impl ProfilePreview {
@@ -48,6 +51,7 @@ impl ProfilePreview {
             identity_file: None,
             note: None,
             ftp_encoding: None,
+            ftp_active_mode: None,
         }
     }
 
@@ -88,6 +92,7 @@ impl ProfilePreview {
             jump_port: None,
             jump_username: None,
             ftp_encoding: self.ftp_encoding,
+            ftp_active_mode: self.ftp_active_mode,
         }
     }
 }
