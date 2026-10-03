@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Plus,
   Download,
@@ -116,6 +117,7 @@ export function ServerRail() {
   const [editing, setEditing] = useState<ConnectionProfile | "new" | null>(null);
   const [importing, setImporting] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const searchToggleRef = useRef<HTMLDivElement>(null);
   // Which profile we last asked to connect — localizes the global
   // connecting/error flags onto the owning bubble (mirrors ConnectionManager).
   const [pendingId, setPendingId] = useState<string | null>(null);
@@ -843,14 +845,16 @@ export function ServerRail() {
 
       {/* Pinned controls */}
       <div className="relative flex flex-col items-center gap-1 border-t border-border py-2">
-        <RailIconButton
-          expanded={expanded}
-          label="Search servers  ·  /"
-          active={searchOpen}
-          onClick={() => setSearchOpen((v) => !v)}
-        >
-          <Search size={17} />
-        </RailIconButton>
+        <div ref={searchToggleRef} className="contents">
+          <RailIconButton
+            expanded={expanded}
+            label="Search servers  ·  /"
+            active={searchOpen}
+            onClick={() => setSearchOpen((v) => !v)}
+          >
+            <Search size={17} />
+          </RailIconButton>
+        </div>
         <RailIconButton
           expanded={expanded}
           label="New connection"
@@ -880,10 +884,15 @@ export function ServerRail() {
             connectedIds={connectedIds}
             onPick={pickFromSearch}
             onClose={() => setSearchOpen(false)}
+            toggleRef={searchToggleRef}
           />
         )}
       </div>
 
+      {/* Portaled: the rail's z-dropdown layer is a stacking context, which would
+          otherwise cap these dialogs at z-30 instead of their own z-modal/menu. */}
+      {createPortal(
+        <>
       {menu && (
         <ContextMenu
           x={menu.x}
@@ -921,6 +930,9 @@ export function ServerRail() {
           onClose={() => setPendingDelete(null)}
           onConfirm={() => deleteProfile(pendingDelete.id)}
         />
+      )}
+        </>,
+        document.body
       )}
       </div>
     </div>
@@ -1474,11 +1486,15 @@ function RailSearch({
   connectedIds,
   onPick,
   onClose,
+  toggleRef,
 }: {
   profiles: ConnectionProfile[];
   connectedIds: Set<string>;
   onPick: (p: ConnectionProfile) => void;
   onClose: () => void;
+  /** The button that toggles search: its own click closes it, so an outside
+   *  mousedown there must not close first (the click would just reopen it). */
+  toggleRef: React.RefObject<HTMLElement>;
 }) {
   const [query, setQuery] = useState("");
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -1488,7 +1504,9 @@ function RailSearch({
     inputRef.current?.focus();
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     const onDown = (e: MouseEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) onClose();
+      const t = e.target as Node;
+      if (!wrapRef.current?.contains(t) && !toggleRef.current?.contains(t))
+        onClose();
     };
     window.addEventListener("keydown", onKey);
     window.addEventListener("mousedown", onDown);
