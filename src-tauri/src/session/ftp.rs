@@ -82,6 +82,24 @@ impl TransferPool {
     }
 }
 
+/// Gives a checked-out slot back if the transfer is dropped (canceled)
+/// before its connection reaches the blocking copy, which returns it itself.
+struct SlotGuard(Option<Arc<TransferPool>>);
+
+impl SlotGuard {
+    fn defuse(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if let Some(pool) = self.0.take() {
+            pool.give_back(None);
+        }
+    }
+}
+
 /// What a checkout got: a pooled connection, or the right to open one.
 enum Slot {
     Idle(FtpStreamKind),
@@ -458,6 +476,7 @@ impl FtpSession {
         let Some(slot) = self.checkout().await else {
             return self.with_stream(f).await;
         };
+        let guard = SlotGuard(Some(self.pool.clone()));
         let profile = self.profile.clone();
         let tls = CertCheck::new(self.pinned_cert.clone());
         let charset = self.detected_charset.clone();
@@ -473,6 +492,7 @@ impl FtpSession {
                     Ok((c, _)) => Some(c),
                     Err(e) => {
                         let pool = &self.pool;
+                        guard.defuse();
                         pool.out.fetch_sub(1, Ordering::AcqRel);
                         if refused_login(&e) {
                             let busy = pool.out.load(Ordering::Acquire).max(1);
@@ -505,6 +525,9 @@ impl FtpSession {
             }
         };
         let pool = self.pool.clone();
+        // From here the blocking copy returns the slot, even if this future
+        // is dropped.
+        guard.defuse();
         tokio::task::spawn_blocking(move || {
             let mut conn = conn;
             // A pooled connection may have been closed by the server while
