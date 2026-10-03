@@ -15,6 +15,8 @@ pub struct FtpSession {
     pub id: String,
     pub profile: ConnectionProfile,
     inner: Arc<StdMutex<FtpStreamKind>>,
+    /// The server advertised `MLST` in FEAT, so `MLSD` listings are available.
+    mlsd: bool,
 }
 
 /// suppaftp ships two separate stream types depending on whether TLS is
@@ -25,6 +27,12 @@ pub enum FtpStreamKind {
 }
 
 impl FtpStreamKind {
+    pub fn mlsd(&mut self, path: &str) -> Result<Vec<String>> {
+        match self {
+            Self::Plain(s) => s.mlsd(Some(path)).map_err(into_anyhow),
+            Self::Tls(s) => s.mlsd(Some(path)).map_err(into_anyhow),
+        }
+    }
     pub fn list(&mut self, path: Option<&str>) -> Result<Vec<String>> {
         match self {
             Self::Plain(s) => s.list(path).map_err(into_anyhow),
@@ -97,14 +105,15 @@ impl FtpStreamKind {
             Self::Tls(s) => s.set_text_codec(codec),
         }
     }
-    /// True when the server advertises `UTF8` in its FEAT reply.
-    fn advertises_utf8(&mut self) -> bool {
+    /// The FEAT keywords the server advertises, upper-cased. Empty when the
+    /// server doesn't implement FEAT.
+    fn features(&mut self) -> Vec<String> {
         let feat = match self {
             Self::Plain(s) => s.feat(),
             Self::Tls(s) => s.feat(),
         };
-        feat.map(|f| f.keys().any(|k| k.trim().eq_ignore_ascii_case("UTF8")))
-            .unwrap_or(false)
+        feat.map(|f| f.keys().map(|k| k.trim().to_ascii_uppercase()).collect())
+            .unwrap_or_default()
     }
     /// `OPTS UTF8 ON`. Servers like IIS and FileZilla Server only switch path
     /// names to UTF-8 once the client asks; errors mean "not supported" and
@@ -204,6 +213,10 @@ fn auto_codec(host: String) -> TextCodec {
 }
 
 impl FtpSession {
+    pub fn supports_mlsd(&self) -> bool {
+        self.mlsd
+    }
+
     /// Run a closure with mutable access to the underlying FTP stream on a
     /// blocking thread. Use this for any FTP operation — it ensures the
     /// blocking syscalls don't pin a tokio worker.
@@ -249,7 +262,7 @@ pub async fn ftp_connect(profile: &ConnectionProfile) -> Result<FtpSession> {
 
     let id = uuid::Uuid::new_v4().to_string();
     let host_for_blocking = host.clone();
-    let stream = tokio::task::spawn_blocking(move || -> Result<FtpStreamKind> {
+    let (stream, mlsd) = tokio::task::spawn_blocking(move || -> Result<(FtpStreamKind, bool)> {
         let addr = format!("{host_for_blocking}:{port}");
         if want_tls {
             // Explicit FTPS: connect as a NativeTlsFtpStream-typed stream
@@ -267,14 +280,14 @@ pub async fn ftp_connect(profile: &ConnectionProfile) -> Result<FtpSession> {
                 )
                 .map_err(|e| anyhow!("FTPS AUTH TLS: {e}"))?;
             let mut tls = FtpStreamKind::Tls(secured);
-            login(&mut tls, &username, &password, &charset, &host_for_blocking)?;
-            Ok(tls)
+            let mlsd = login(&mut tls, &username, &password, &charset, &host_for_blocking)?;
+            Ok((tls, mlsd))
         } else {
             let s = FtpStream::connect(&addr)
                 .with_context(|| format!("FTP connect {addr}"))?;
             let mut plain = FtpStreamKind::Plain(s);
-            login(&mut plain, &username, &password, &charset, &host_for_blocking)?;
-            Ok(plain)
+            let mlsd = login(&mut plain, &username, &password, &charset, &host_for_blocking)?;
+            Ok((plain, mlsd))
         }
     })
     .await
@@ -284,17 +297,19 @@ pub async fn ftp_connect(profile: &ConnectionProfile) -> Result<FtpSession> {
         id,
         profile: profile.clone(),
         inner: Arc::new(StdMutex::new(stream)),
+        mlsd,
     })
 }
 
-/// Log in, then settle the connection's character set.
+/// Log in, then settle the connection's character set. Returns whether the
+/// server supports MLSD.
 fn login(
     stream: &mut FtpStreamKind,
     user: &str,
     password: &str,
     charset: &Charset,
     host: &str,
-) -> Result<()> {
+) -> Result<bool> {
     // A fixed codepage applies to USER/PASS too; auto and UTF-8 send them as
     // UTF-8, which is identical for the ASCII credentials nearly everyone uses.
     if let Charset::Fixed(enc) = charset {
@@ -304,17 +319,19 @@ fn login(
         FtpStreamKind::Plain(s) => s.login(user, password).map_err(into_anyhow)?,
         FtpStreamKind::Tls(s) => s.login(user, password).map_err(into_anyhow)?,
     }
+    let features = stream.features();
+    let has = |f: &str| features.iter().any(|k| k == f);
     match charset {
         Charset::Fixed(_) => {}
         Charset::Utf8 => stream.opts_utf8_on(),
         Charset::Auto => {
-            if stream.advertises_utf8() {
+            if has("UTF8") {
                 stream.opts_utf8_on();
             }
             stream.set_text_codec(Some(auto_codec(host.to_string())));
         }
     }
-    Ok(())
+    Ok(has("MLST"))
 }
 
 #[cfg(test)]
