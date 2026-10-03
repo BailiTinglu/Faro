@@ -649,7 +649,7 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
               className={inputCls}
             />
           </Field>
-          <Field label="Icon (optional)" className="w-40">
+          <Field group label="Icon (optional)" className="w-40">
             <IconPicker
               value={icon}
               onChange={setIcon}
@@ -1270,7 +1270,7 @@ function KeyAuthSection({
             Generate a new SSH key
           </div>
 
-          <Field label="Type">
+          <Field group label="Type">
             <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-bg-panel p-1">
               {(
                 [
@@ -1908,7 +1908,7 @@ function WebdavSection({
 
   return (
     <>
-      <Field label="Provider">
+      <Field group label="Provider">
         <div className="grid grid-cols-4 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(Object.keys(WEBDAV_PROVIDER_PRESETS) as WebdavProvider[]).map((p) => {
             const data = WEBDAV_PROVIDER_PRESETS[p];
@@ -1957,7 +1957,7 @@ function WebdavSection({
         />
       </Field>
 
-      <Field label="Auth">
+      <Field group label="Auth">
         <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(["basic", "bearer"] as const).map((m) => (
             <button
@@ -2039,7 +2039,7 @@ function ShopifySection({
         unpublished/duplicate theme — changes deploy instantly.
       </Hint>
 
-      <Field label="Auth">
+      <Field group label="Auth">
         <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(["token", "client"] as const).map((m) => (
             <button
@@ -2185,7 +2185,7 @@ function DynamicsSection({
         Edits publish immediately — prefer a dev/sandbox environment.
       </Hint>
 
-      <Field label="Auth">
+      <Field group label="Auth">
         <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(["client", "delegated"] as const).map((m) => (
             <button
@@ -2286,7 +2286,7 @@ function GcsSection({
         />
       </Field>
 
-      <Field label="Service account key">
+      <Field group label="Service account key">
         <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(["file", "paste"] as const).map((m) => (
             <button
@@ -2361,7 +2361,7 @@ function S3Section({
   const preset = S3_PROVIDER_PRESETS[provider];
   return (
     <>
-      <Field label="Provider">
+      <Field group label="Provider">
         <div className="grid grid-cols-3 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(Object.keys(S3_PROVIDER_PRESETS) as S3Provider[]).map((p) => {
             const data = S3_PROVIDER_PRESETS[p];
@@ -2579,17 +2579,22 @@ const inputCls =
 function Field({
   label,
   className,
+  group,
   children,
 }: {
   label: string;
   className?: string;
+  /** Wraps buttons, not one input: render a <div>, since a <label> turns any
+   *  click on its caption or padding into a click on its first button. */
+  group?: boolean;
   children: React.ReactNode;
 }) {
+  const Tag = group ? "div" : "label";
   return (
-    <label className={`mb-3 block ${className ?? ""}`}>
+    <Tag className={`mb-3 block ${className ?? ""}`}>
       <div className="mb-1 text-xs text-text-muted">{label}</div>
       {children}
-    </label>
+    </Tag>
   );
 }
 
