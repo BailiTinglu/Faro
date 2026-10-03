@@ -8,6 +8,20 @@ export function fmtSize(n: number): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+// Bytes/sec -> "12.3 MB/s".
+export function fmtRate(bps: number): string {
+  return `${fmtSize(Math.round(bps))}/s`;
+}
+
+// Seconds left -> "45s", "4m 05s", "2h 03m".
+export function fmtEta(secs: number): string {
+  const s = Math.max(0, Math.round(secs));
+  if (s < 60) return `${s}s`;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  if (s < 3600) return `${Math.floor(s / 60)}m ${pad(s % 60)}s`;
+  return `${Math.floor(s / 3600)}h ${pad(Math.floor((s % 3600) / 60))}m`;
+}
+
 // Unix seconds -> "2024-05-21 14:32". Empty string when unknown.
 export function fmtMtime(secs?: number): string {
   if (!secs) return "";

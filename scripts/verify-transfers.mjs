@@ -302,6 +302,63 @@ async function main() {
     );
     await shot("7-retrying");
 
+    // ---- 8. Plan 24: batched progress drives speed / ETA / stalled / notice ----
+    await drive(() => {
+      const mk = (id, extra = {}) => ({
+        id,
+        kind: "download",
+        source: `/srv/big/${id}.iso`,
+        destination: `C:\\Users\\demo\\Downloads\\${id}.iso`,
+        size: 100 * 1024 * 1024,
+        transferred: 0,
+        status: "transferring",
+        startedAt: Date.now(),
+        ...extra,
+      });
+      window.__demo.seedTransfers([mk("s1"), mk("s2"), mk("s3")], { waiting: [] });
+      return window.__demo.useTransfers.getState().loadInitial();
+    });
+    await sleep(300);
+    // One batch event updates several rows at once.
+    await drive(() => {
+      const base = (id, extra) => ({
+        ...window.__demo.useTransfers.getState().byId[id],
+        ...extra,
+      });
+      window.__demo.emit("transfer://progress-batch", [
+        base("s1", { transferred: 50 * 1024 * 1024, bytesPerSec: 5 * 1024 * 1024, etaSecs: 10, segments: 4 }),
+        base("s2", { transferred: 10 * 1024 * 1024, bytesPerSec: 1024 * 1024, etaSecs: 90 }),
+        base("s3", { transferred: 1024 * 1024, stalled: true, notice: "remote changed, restarted" }),
+      ]);
+    });
+    await sleep(300);
+    t = await rowText("/srv/big/s1.iso");
+    check("batched row shows its speed", t.includes("5.0 MB/s"), t.replace(/\n/g, " | "));
+    check("batched row shows its ETA", t.includes("10s"), t.replace(/\n/g, " | "));
+    check("batched row shows 50%", t.includes("50%"), t.replace(/\n/g, " | "));
+    check(
+      "segment count is in the speed tooltip",
+      await drive(() =>
+        !!window.__vt.row("/srv/big/s1.iso")?.querySelector('[title="4 parallel connections"]')
+      )
+    );
+    t = await rowText("/srv/big/s2.iso");
+    check(
+      "second row from the same batch updated",
+      t.includes("1.0 MB/s") && t.includes("1m 30s"),
+      t.replace(/\n/g, " | ")
+    );
+    t = await rowText("/srv/big/s3.iso");
+    check("stalled row reads 'not responding'", t.includes("not responding"), t.replace(/\n/g, " | "));
+    check("notice line renders", t.includes("remote changed, restarted"), t.replace(/\n/g, " | "));
+    const hdr8 = await drive(() => document.body.innerText);
+    check(
+      "header shows the combined speed",
+      hdr8.includes("6.0 MB/s"),
+      hdr8.match(/[\d.]+ MB\/s/g)?.join(",") ?? "none"
+    );
+    await shot("8-speed-eta");
+
     if (failures === 0) console.log("\n✅ all transfer-queue checks passed");
     else console.log(`\n❌ ${failures} check(s) failed`);
   } finally {

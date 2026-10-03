@@ -139,13 +139,30 @@ export function start(
   let t: Transfer = { id, kind, source, destination, size, transferred: 0, status: "transferring", startedAt: Date.now() };
   update(t);
   const steps = 24;
+  const tickMs = 350;
   let i = 0;
   const timer = setInterval(() => {
     i++;
     const done = i >= steps;
-    t = { ...t, transferred: done ? size : Math.round((size * i) / steps), status: done ? "done" : "transferring" };
-    update(t);
-    if (done) clearInterval(timer);
-  }, 350);
+    const transferred = done ? size : Math.round((size * i) / steps);
+    if (done) {
+      t = { ...t, transferred, status: "done", bytesPerSec: undefined, etaSecs: undefined };
+      byId.set(t.id, t);
+      emit("transfer://done", t);
+      clearInterval(timer);
+    } else {
+      // Like the backend's 250 ms tick: running rows arrive as a batch.
+      const bytesPerSec = Math.round(size / steps / (tickMs / 1000));
+      t = {
+        ...t,
+        transferred,
+        status: "transferring",
+        bytesPerSec,
+        etaSecs: Math.ceil((size - transferred) / bytesPerSec),
+      };
+      byId.set(t.id, t);
+      emit("transfer://progress-batch", [t]);
+    }
+  }, tickMs);
   return id;
 }

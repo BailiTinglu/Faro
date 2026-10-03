@@ -1119,6 +1119,16 @@ export interface Transfer {
    *  persists on done transfers. */
   delta?: { sent: number; reused: number };
   startedAt: number;
+  /** Moving-average speed over the last ~10 s (Plan 24), while transferring. */
+  bytesPerSec?: number;
+  /** Seconds left at the current speed; absent when unknown. */
+  etaSecs?: number;
+  /** Parallel ranges/parts in flight (segmented transfers). */
+  segments?: number;
+  /** No bytes have moved for a few seconds ("not responding"). */
+  stalled?: boolean;
+  /** One-line note about the run, e.g. "remote changed, restarted". */
+  notice?: string;
 }
 
 /** Live transfer-queue snapshot (Plan 17) — payload of `transfer://queue` and

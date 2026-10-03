@@ -1,5 +1,10 @@
 import { create } from "zustand";
-import { ipc, onTransferEvent, onTransferQueue } from "@/lib/ipc";
+import {
+  ipc,
+  onTransferEvent,
+  onTransferProgressBatch,
+  onTransferQueue,
+} from "@/lib/ipc";
 import { useSettings } from "./settingsStore";
 import { toast } from "./toastStore";
 import { useConflicts, type ConflictDecision } from "./conflictStore";
@@ -221,6 +226,14 @@ export const useTransfers = create<TransfersState>((set, get) => ({
         toast.error("Transfer failed", t.error || baseName(t.source));
       }
     });
+    // One set() per 250 ms batch, however many transfers are running.
+    const unlistenBatch = await onTransferProgressBatch((ts) => {
+      set((s) => {
+        const byId = { ...s.byId };
+        for (const t of ts) byId[t.id] = t;
+        return { byId };
+      });
+    });
     const unlistenQueue = await onTransferQueue((q) => {
       set({
         queue: q.waiting,
@@ -231,6 +244,7 @@ export const useTransfers = create<TransfersState>((set, get) => ({
     });
     return () => {
       unlistenEvents();
+      unlistenBatch();
       unlistenQueue();
     };
   },

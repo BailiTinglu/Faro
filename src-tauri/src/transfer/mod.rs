@@ -16,6 +16,10 @@ use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+mod speed;
+
+use speed::Live;
+
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum OverwritePolicy {
@@ -285,11 +289,36 @@ pub struct Transfer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<DeltaStats>,
     pub started_at: i64,
+    /// Moving-average speed over the last ~10 s while transferring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_per_sec: Option<u64>,
+    /// Seconds left at the current speed; absent when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<u64>,
+    /// Parallel ranges/parts in flight (segmented transfers only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<u32>,
+    /// No bytes have moved for a few seconds ("not responding").
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stalled: bool,
+    /// One-line note about the run, e.g. "remote changed, restarted".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
     /// An earlier attempt of this transfer created (or truncated) the
     /// destination and started writing it, so a partial file there is ours
     /// to resume rather than someone else's file to overwrite. FTP only.
     #[serde(skip)]
     pub resumable: bool,
+}
+
+impl Transfer {
+    /// Drop the live-only fields once the row stops transferring.
+    fn settle(&mut self) {
+        self.bytes_per_sec = None;
+        self.eta_secs = None;
+        self.segments = None;
+        self.stalled = false;
+    }
 }
 
 /// Delta-sync outcome attached to a finished [`Transfer`] (Agent backend only).
@@ -363,6 +392,9 @@ pub struct TransferManager {
     /// `AppHandle` (or `set_app` at startup); unset in unit tests, where
     /// emits are simply skipped.
     app: std::sync::OnceLock<AppHandle>,
+    /// Lock-free counters of running transfers, read by the progress tick.
+    live: std::sync::Mutex<HashMap<String, Arc<Live>>>,
+    ticker: AtomicBool,
 }
 
 fn now_ts() -> i64 {
@@ -455,7 +487,91 @@ impl TransferManager {
             bucket: TokenBucket::new(),
             delta_enabled: AtomicBool::new(true),
             app: std::sync::OnceLock::new(),
+            live: std::sync::Mutex::new(HashMap::new()),
+            ticker: AtomicBool::new(false),
         }
+    }
+
+    /// The live counters for `id`, created on first use.
+    fn live(&self, id: &str) -> Arc<Live> {
+        let mut map = self.live.lock().expect("live map poisoned");
+        Arc::clone(map.entry(id.to_string()).or_default())
+    }
+
+    fn drop_live(&self, id: &str) {
+        self.live.lock().expect("live map poisoned").remove(id);
+    }
+
+    /// A copy loop reached `total` bytes. Lock-free: the 250 ms tick turns
+    /// it into a progress event.
+    fn progress(&self, id: &str, total: u64) {
+        self.live(id).set(total);
+    }
+
+    /// Start the progress tick (once): every 250 ms, fold the live counters
+    /// into the rows, compute speed/ETA, and emit one
+    /// `transfer://progress-batch` with every row that changed.
+    pub fn start_ticker(self: &Arc<Self>) {
+        if self.ticker.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        tauri::async_runtime::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_millis(250));
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                every.tick().await;
+                let Some(mgr) = weak.upgrade() else { break };
+                let changed = mgr.tick().await;
+                if !changed.is_empty() {
+                    mgr.emit("transfer://progress-batch", &changed);
+                }
+            }
+        });
+    }
+
+    /// One progress tick; returns the rows that changed.
+    async fn tick(&self) -> Vec<Transfer> {
+        let live: Vec<(String, Arc<Live>)> = self
+            .live
+            .lock()
+            .expect("live map poisoned")
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        if live.is_empty() {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let mut changed = Vec::new();
+        let mut transfers = self.transfers.lock().await;
+        for (id, l) in live {
+            let Some(t) = transfers.get_mut(&id) else { continue };
+            if t.status != TransferStatus::Transferring {
+                continue;
+            }
+            let bytes = l.get();
+            let speed = l.ring.lock().expect("speed ring poisoned").sample(bytes, now);
+            let segments = match l.segments.load(Ordering::Relaxed) {
+                0 => None,
+                n => Some(n as u32),
+            };
+            let stalled = l.stalled.load(Ordering::Relaxed);
+            let eta = speed::eta_secs(t.size, bytes, speed);
+            if t.transferred != bytes
+                || t.bytes_per_sec != speed
+                || t.segments != segments
+                || t.stalled != stalled
+            {
+                t.transferred = bytes;
+                t.bytes_per_sec = speed;
+                t.eta_secs = eta;
+                t.segments = segments;
+                t.stalled = stalled;
+                changed.push(t.clone());
+            }
+        }
+        changed
     }
 
     /// Bind the app handle events are emitted through.
@@ -668,6 +784,7 @@ impl TransferManager {
             } else {
                 TransferStatus::Queued
             };
+            t.settle();
         })
         .await;
         if let Some(t) = self.get(id).await {
@@ -691,7 +808,11 @@ impl TransferManager {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("transfer {id} not found"))?;
         gate.set(true);
-        self.update(id, |t| t.status = TransferStatus::Paused).await;
+        self.update(id, |t| {
+            t.status = TransferStatus::Paused;
+            t.settle();
+        })
+        .await;
         if let Some(t) = self.get(id).await {
             let _ = app.emit("transfer://updated", &t);
         }
@@ -818,12 +939,14 @@ impl TransferManager {
         if let Some(h) = self.tasks.lock().await.remove(id) {
             h.abort();
         }
+        self.drop_live(id);
         self.update(id, |t| {
             if matches!(
                 t.status,
                 TransferStatus::Transferring | TransferStatus::Queued | TransferStatus::Paused
             ) {
                 t.status = TransferStatus::Canceled;
+                t.settle();
             }
         })
         .await;
@@ -872,6 +995,11 @@ impl TransferManager {
             retry_attempt: None,
             delta: None,
             started_at: now_ts(),
+            bytes_per_sec: None,
+            eta_secs: None,
+            segments: None,
+            stalled: false,
+            notice: None,
             resumable: false,
         };
         self.insert(transfer.clone()).await;
@@ -918,7 +1046,6 @@ impl TransferManager {
         session: &Arc<crate::session::AgentSession>,
         remote_path: &str,
         local_path: &Path,
-        app: Option<&AppHandle>,
     ) -> Result<u64> {
         use base64::Engine as _;
         use faro_agent_proto::msg::{Request, Response};
@@ -928,7 +1055,6 @@ impl TransferManager {
             .await
             .with_context(|| format!("create {}", local_path.display()))?;
         let mut offset: u64 = 0;
-        let mut last_emit = Instant::now();
         loop {
             let resp = session
                 .request(Request::ReadChunk { path: remote_path.to_string(), offset, len: 0 })
@@ -947,15 +1073,7 @@ impl TransferManager {
             if !bytes.is_empty() {
                 local_file.write_all(&bytes).await?;
                 offset += bytes.len() as u64;
-                if last_emit.elapsed() > Duration::from_millis(100) {
-                    self.update(id, |t| t.transferred = offset).await;
-                    if let Some(app) = app {
-                        if let Some(t) = self.get(id).await {
-                            let _ = app.emit("transfer://progress", &t);
-                        }
-                    }
-                    last_emit = Instant::now();
-                }
+                self.progress(id, offset);
             }
             if eof {
                 break;
@@ -972,7 +1090,6 @@ impl TransferManager {
         session: Arc<SshSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
@@ -990,7 +1107,6 @@ impl TransferManager {
 
         let mut buf = vec![0u8; 64 * 1024];
         let mut transferred: u64 = 0;
-        let mut last_emit = Instant::now();
         loop {
             let n = remote_file.read(&mut buf).await?;
             if n == 0 {
@@ -999,13 +1115,7 @@ impl TransferManager {
             self.checkpoint(id, n as u64).await?;
             local_file.write_all(&buf[..n]).await?;
             transferred += n as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = transferred).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, transferred);
         }
         local_file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
@@ -1051,6 +1161,11 @@ impl TransferManager {
             retry_attempt: None,
             delta: None,
             started_at: now_ts(),
+            bytes_per_sec: None,
+            eta_secs: None,
+            segments: None,
+            stalled: false,
+            notice: None,
             resumable: false,
         };
         self.insert(transfer.clone()).await;
@@ -1095,7 +1210,6 @@ impl TransferManager {
         session: &Arc<crate::session::AgentSession>,
         local_path: &Path,
         remote_path: &str,
-        app: Option<&AppHandle>,
     ) -> Result<u64> {
         use base64::Engine as _;
         use faro_agent_proto::msg::{Request, Response};
@@ -1109,7 +1223,6 @@ impl TransferManager {
         let mut buf = vec![0u8; 128 * 1024];
         let mut offset: u64 = 0;
         let mut first = true;
-        let mut last_emit = Instant::now();
         loop {
             let n = local_file.read(&mut buf).await?;
             if n == 0 {
@@ -1135,15 +1248,7 @@ impl TransferManager {
             }
             offset += n as u64;
             first = false;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = offset).await;
-                if let Some(app) = app {
-                    if let Some(t) = self.get(id).await {
-                        let _ = app.emit("transfer://progress", &t);
-                    }
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, offset);
         }
         self.update(id, |t| t.transferred = offset).await;
         Ok(offset)
@@ -1158,9 +1263,8 @@ impl TransferManager {
         session: Arc<crate::session::AgentSession>,
         local_path: &Path,
         remote_path: &str,
-        app: &AppHandle,
     ) -> Result<u64> {
-        self.agent_upload_with_delta_core(id, &session, local_path, remote_path, Some(app))
+        self.agent_upload_with_delta_core(id, &session, local_path, remote_path)
             .await
     }
 
@@ -1172,14 +1276,13 @@ impl TransferManager {
         session: &Arc<crate::session::AgentSession>,
         local_path: &Path,
         remote_path: &str,
-        app: Option<&AppHandle>,
     ) -> Result<u64> {
         let size = tokio::fs::metadata(local_path).await.map(|m| m.len()).unwrap_or(0);
         let (_basis_size, basis_exists) = agent_stat(session, remote_path).await;
         if self.delta_enabled() && faro_agent_proto::delta::should_attempt_delta(size, basis_exists, true)
         {
             match self
-                .agent_delta_upload_core(id, session, local_path, remote_path, app)
+                .agent_delta_upload_core(id, session, local_path, remote_path)
                 .await
             {
                 Ok(n) => return Ok(n),
@@ -1189,7 +1292,7 @@ impl TransferManager {
                 }
             }
         }
-        self.agent_upload_core(id, session, local_path, remote_path, app)
+        self.agent_upload_core(id, session, local_path, remote_path)
             .await
     }
 
@@ -1205,7 +1308,6 @@ impl TransferManager {
         session: &Arc<crate::session::AgentSession>,
         local_path: &Path,
         remote_path: &str,
-        app: Option<&AppHandle>,
     ) -> Result<u64> {
         use base64::Engine as _;
         use faro_agent_proto::delta;
@@ -1273,7 +1375,6 @@ impl TransferManager {
             let mut buf = vec![0u8; 128 * 1024];
             let mut offset: u64 = 0;
             let mut first = true;
-            let mut last_emit = Instant::now();
             loop {
                 let n = patch_file.read(&mut buf).await?;
                 if n == 0 {
@@ -1299,15 +1400,7 @@ impl TransferManager {
                 }
                 offset += n as u64;
                 first = false;
-                if last_emit.elapsed() > Duration::from_millis(100) {
-                    self.update(id, |t| t.transferred = offset).await;
-                    if let Some(app) = app {
-                        if let Some(t) = self.get(id).await {
-                            let _ = app.emit("transfer://progress", &t);
-                        }
-                    }
-                    last_emit = Instant::now();
-                }
+                self.progress(id, offset);
             }
             // Charge the reused bytes too so pause gates and the throttle
             // bucket see the same totals a whole-file copy would.
@@ -1351,11 +1444,6 @@ impl TransferManager {
             t.delta = Some(DeltaStats { sent: plan.literal_bytes, reused: plan.reused_bytes });
         })
         .await;
-        if let Some(app) = app {
-            if let Some(t) = self.get(id).await {
-                let _ = app.emit("transfer://progress", &t);
-            }
-        }
         Ok(size)
     }
 
@@ -1367,9 +1455,8 @@ impl TransferManager {
         session: Arc<crate::session::AgentSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
-        self.agent_download_with_delta_core(id, &session, remote_path, local_path, Some(app))
+        self.agent_download_with_delta_core(id, &session, remote_path, local_path)
             .await
     }
 
@@ -1381,7 +1468,6 @@ impl TransferManager {
         session: &Arc<crate::session::AgentSession>,
         remote_path: &str,
         local_path: &Path,
-        app: Option<&AppHandle>,
     ) -> Result<u64> {
         let (size, remote_exists) = agent_stat(session, remote_path).await;
         let basis_exists = tokio::fs::metadata(local_path).await.is_ok();
@@ -1390,7 +1476,7 @@ impl TransferManager {
             && faro_agent_proto::delta::should_attempt_delta(size, basis_exists, true)
         {
             match self
-                .agent_delta_download_core(id, session, remote_path, local_path, app)
+                .agent_delta_download_core(id, session, remote_path, local_path)
                 .await
             {
                 Ok(n) => return Ok(n),
@@ -1400,7 +1486,7 @@ impl TransferManager {
                 }
             }
         }
-        self.agent_download_core(id, session, remote_path, local_path, app)
+        self.agent_download_core(id, session, remote_path, local_path)
             .await
     }
 
@@ -1416,7 +1502,6 @@ impl TransferManager {
         session: &Arc<crate::session::AgentSession>,
         remote_path: &str,
         local_path: &Path,
-        app: Option<&AppHandle>,
     ) -> Result<u64> {
         use base64::Engine as _;
         use faro_agent_proto::delta;
@@ -1491,7 +1576,6 @@ impl TransferManager {
                 .await
                 .with_context(|| format!("create {}", patch_path.display()))?;
             let mut fetched: u64 = 0;
-            let mut last_emit = Instant::now();
             for &(range_off, range_len) in &needed {
                 let mut got: u64 = 0;
                 while got < range_len {
@@ -1521,15 +1605,7 @@ impl TransferManager {
                     patch_file.write_all(&bytes).await?;
                     got += bytes.len() as u64;
                     fetched += bytes.len() as u64;
-                    if last_emit.elapsed() > Duration::from_millis(100) {
-                        self.update(id, |t| t.transferred = fetched).await;
-                        if let Some(app) = app {
-                            if let Some(t) = self.get(id).await {
-                                let _ = app.emit("transfer://progress", &t);
-                            }
-                        }
-                        last_emit = Instant::now();
-                    }
+                    self.progress(id, fetched);
                 }
             }
             patch_file.flush().await?;
@@ -1582,11 +1658,6 @@ impl TransferManager {
             t.delta = Some(DeltaStats { sent: plan.literal_bytes, reused: plan.reused_bytes });
         })
         .await;
-        if let Some(app) = app {
-            if let Some(t) = self.get(id).await {
-                let _ = app.emit("transfer://progress", &t);
-            }
-        }
         Ok(size)
     }
 
@@ -1596,7 +1667,6 @@ impl TransferManager {
         session: Arc<SshSession>,
         local_path: &Path,
         remote_path: &str,
-        app: &AppHandle,
     ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
@@ -1614,7 +1684,6 @@ impl TransferManager {
 
         let mut buf = vec![0u8; 64 * 1024];
         let mut transferred: u64 = 0;
-        let mut last_emit = Instant::now();
         loop {
             let n = local_file.read(&mut buf).await?;
             if n == 0 {
@@ -1623,13 +1692,7 @@ impl TransferManager {
             self.checkpoint(id, n as u64).await?;
             remote_file.write_all(&buf[..n]).await?;
             transferred += n as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = transferred).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, transferred);
         }
         remote_file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
@@ -1785,7 +1848,6 @@ impl TransferManager {
         session: Arc<FtpSession>,
         remote_path: &str,
         local_path: &Path,
-        app: Option<&AppHandle>,
     ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
@@ -1824,7 +1886,7 @@ impl TransferManager {
             sink.finish()?;
             Ok(())
         });
-        let (res, (stop, done)) = tokio::join!(copy, self.ftp_pump(id, app, rx, ack));
+        let (res, (stop, done)) = tokio::join!(copy, self.ftp_pump(id, rx, ack));
         // A pause/cancel at a checkpoint is the real reason the copy failed.
         if let Some(e) = stop {
             return Err(e);
@@ -1840,7 +1902,6 @@ impl TransferManager {
         session: Arc<FtpSession>,
         local_path: &Path,
         remote_path: &str,
-        app: Option<&AppHandle>,
     ) -> Result<u64> {
         use std::io::{Seek, SeekFrom};
         self.update(id, |t| t.status = TransferStatus::Transferring)
@@ -1877,7 +1938,7 @@ impl TransferManager {
             reader.finish()?;
             Ok(())
         });
-        let (res, (stop, done)) = tokio::join!(copy, self.ftp_pump(id, app, rx, ack));
+        let (res, (stop, done)) = tokio::join!(copy, self.ftp_pump(id, rx, ack));
         if let Some(e) = stop {
             return Err(e);
         }
@@ -1891,17 +1952,16 @@ impl TransferManager {
     async fn ftp_pump(
         &self,
         id: &str,
-        app: Option<&AppHandle>,
         mut rx: tokio::sync::mpsc::Receiver<FtpProgress>,
         ack: std::sync::mpsc::SyncSender<bool>,
     ) -> (Option<anyhow::Error>, u64) {
         let mut done = 0u64;
-        let mut last_emit = Instant::now();
         while let Some(msg) = rx.recv().await {
             match msg {
                 FtpProgress::Start(offset) => {
                     // From here on the destination is this transfer's partial.
                     done = offset;
+                    self.progress(id, offset);
                     self.update(id, |t| {
                         t.transferred = offset;
                         t.resumable = true;
@@ -1915,13 +1975,7 @@ impl TransferManager {
                         return (Some(e), done);
                     }
                     done += n;
-                    if last_emit.elapsed() > Duration::from_millis(100) {
-                        self.update(id, |t| t.transferred = done).await;
-                        if let (Some(app), Some(t)) = (app, self.get(id).await) {
-                            let _ = app.emit("transfer://progress", &t);
-                        }
-                        last_emit = Instant::now();
-                    }
+                    self.progress(id, done);
                     let _ = ack.send(true);
                 }
             }
@@ -1936,7 +1990,6 @@ impl TransferManager {
         session: Arc<ObjectSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
@@ -1957,19 +2010,12 @@ impl TransferManager {
             .with_context(|| format!("create {}", local_path.display()))?;
         let mut stream = get.into_stream();
         let mut transferred: u64 = 0;
-        let mut last_emit = Instant::now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("s3 chunk for {key}"))?;
             self.checkpoint(id, chunk.len() as u64).await?;
             file.write_all(&chunk).await?;
             transferred += chunk.len() as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = transferred).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, transferred);
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
@@ -1982,7 +2028,6 @@ impl TransferManager {
         session: Arc<ObjectSession>,
         local_path: &Path,
         remote_path: &str,
-        app: &AppHandle,
     ) -> Result<u64> {
         use tokio::io::AsyncReadExt;
 
@@ -2013,9 +2058,6 @@ impl TransferManager {
                 .await
                 .with_context(|| format!("s3 put {key}"))?;
             self.update(id, |t| t.transferred = size).await;
-            if let Some(t) = self.get(id).await {
-                let _ = app.emit("transfer://progress", &t);
-            }
             return Ok(size);
         }
 
@@ -2032,7 +2074,6 @@ impl TransferManager {
 
         const PART: usize = 8 * 1024 * 1024;
         let mut transferred: u64 = 0;
-        let mut last_emit = Instant::now();
         let mut buf = vec![0u8; PART];
         loop {
             let mut filled = 0;
@@ -2054,13 +2095,7 @@ impl TransferManager {
                 .await
                 .with_context(|| format!("s3 put_part {key}"))?;
             transferred += filled as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = transferred).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, transferred);
             if filled < buf.len() {
                 break;
             }
@@ -2081,7 +2116,6 @@ impl TransferManager {
         session: Arc<WebdavSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         use futures::StreamExt;
 
@@ -2106,19 +2140,12 @@ impl TransferManager {
             .with_context(|| format!("create {}", local_path.display()))?;
         let mut stream = resp.bytes_stream();
         let mut transferred: u64 = 0;
-        let mut last_emit = Instant::now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("webdav chunk for {remote_path}"))?;
             self.checkpoint(id, chunk.len() as u64).await?;
             file.write_all(&chunk).await?;
             transferred += chunk.len() as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = transferred).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, transferred);
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
@@ -2133,13 +2160,11 @@ impl TransferManager {
         session: Arc<WebdavSession>,
         local_path: &Path,
         remote_path: &str,
-        app: &AppHandle,
     ) -> Result<u64> {
         use tokio_util::io::ReaderStream;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
-        let _ = app; // WebDAV PUT reports at completion, like the FTP path.
 
         let size = tokio::fs::metadata(local_path)
             .await
@@ -2176,7 +2201,6 @@ impl TransferManager {
         session: Arc<HttpSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         use futures::StreamExt;
 
@@ -2201,19 +2225,12 @@ impl TransferManager {
             .with_context(|| format!("create {}", local_path.display()))?;
         let mut stream = resp.bytes_stream();
         let mut transferred: u64 = 0;
-        let mut last_emit = Instant::now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("http chunk for {remote_path}"))?;
             self.checkpoint(id, chunk.len() as u64).await?;
             file.write_all(&chunk).await?;
             transferred += chunk.len() as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = transferred).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, transferred);
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
@@ -2228,7 +2245,6 @@ impl TransferManager {
         session: Arc<DropboxSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         use futures::StreamExt;
 
@@ -2244,19 +2260,12 @@ impl TransferManager {
             .with_context(|| format!("create {}", local_path.display()))?;
         let mut stream = resp.bytes_stream();
         let mut transferred: u64 = 0;
-        let mut last_emit = Instant::now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("dropbox chunk for {remote_path}"))?;
             self.checkpoint(id, chunk.len() as u64).await?;
             file.write_all(&chunk).await?;
             transferred += chunk.len() as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = transferred).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, transferred);
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
@@ -2272,13 +2281,11 @@ impl TransferManager {
         session: Arc<DropboxSession>,
         local_path: &Path,
         remote_path: &str,
-        app: &AppHandle,
     ) -> Result<u64> {
         use tokio_util::io::ReaderStream;
 
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
-        let _ = app; // Dropbox reports at completion, like the FTP/WebDAV paths.
 
         let size = tokio::fs::metadata(local_path)
             .await
@@ -2345,11 +2352,9 @@ impl TransferManager {
         session: Arc<ShopifySession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
-        let _ = app; // single-shot API: progress is reported at completion.
 
         self.checkpoint(id, 0).await?;
         let data = crate::remotefs::shopify::read_asset(&session, remote_path).await?;
@@ -2376,11 +2381,9 @@ impl TransferManager {
         session: Arc<ShopifySession>,
         local_path: &Path,
         remote_path: &str,
-        app: &AppHandle,
     ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
-        let _ = app; // Shopify reports at completion, like the Dropbox path.
 
         let data = tokio::fs::read(local_path)
             .await
@@ -2401,11 +2404,9 @@ impl TransferManager {
         session: Arc<HubSpotSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
-        let _ = app; // single-shot API: progress is reported at completion.
 
         self.checkpoint(id, 0).await?;
         let data = crate::remotefs::hubspot::read_file(&session, remote_path).await?;
@@ -2433,11 +2434,9 @@ impl TransferManager {
         session: Arc<HubSpotSession>,
         local_path: &Path,
         remote_path: &str,
-        app: &AppHandle,
     ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
-        let _ = app; // HubSpot reports at completion, like the Shopify path.
 
         let data = tokio::fs::read(local_path)
             .await
@@ -2458,11 +2457,9 @@ impl TransferManager {
         session: Arc<DynamicsSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
-        let _ = app; // single-shot API: progress is reported at completion.
 
         self.checkpoint(id, 0).await?;
         let data = crate::remotefs::dynamics::read_file(&session, remote_path).await?;
@@ -2489,11 +2486,9 @@ impl TransferManager {
         session: Arc<DynamicsSession>,
         local_path: &Path,
         remote_path: &str,
-        app: &AppHandle,
     ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
-        let _ = app; // Dynamics reports at completion, like the HubSpot path.
 
         let data = tokio::fs::read(local_path)
             .await
@@ -2513,7 +2508,6 @@ impl TransferManager {
         session: Arc<OneDriveSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         use futures::StreamExt;
 
@@ -2528,19 +2522,12 @@ impl TransferManager {
             .with_context(|| format!("create {}", local_path.display()))?;
         let mut stream = resp.bytes_stream();
         let mut transferred: u64 = 0;
-        let mut last_emit = Instant::now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("onedrive chunk for {remote_path}"))?;
             self.checkpoint(id, chunk.len() as u64).await?;
             file.write_all(&chunk).await?;
             transferred += chunk.len() as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = transferred).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, transferred);
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
@@ -2555,7 +2542,6 @@ impl TransferManager {
         session: Arc<OneDriveSession>,
         local_path: &Path,
         remote_path: &str,
-        app: &AppHandle,
     ) -> Result<u64> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
@@ -2575,7 +2561,7 @@ impl TransferManager {
             self.onedrive_simple_upload(id, &session, local_path, remote_path)
                 .await?;
         } else {
-            self.onedrive_session_upload(id, &session, local_path, remote_path, size, app)
+            self.onedrive_session_upload(id, &session, local_path, remote_path, size)
                 .await?;
         }
         self.update(id, |t| t.transferred = size).await;
@@ -2629,7 +2615,6 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
         size: u64,
-        app: &AppHandle,
     ) -> Result<()> {
         // Create the upload session.
         let item = crate::remotefs::onedrive::item_ref(remote_path);
@@ -2653,7 +2638,6 @@ impl TransferManager {
             .with_context(|| format!("open {}", local_path.display()))?;
         let mut buf = vec![0u8; CHUNK];
         let mut offset: u64 = 0;
-        let mut last_emit = Instant::now();
         while offset < size {
             let mut filled = 0;
             while filled < buf.len() {
@@ -2685,13 +2669,7 @@ impl TransferManager {
                 return Err(anyhow::anyhow!("upload {remote_path} chunk failed ({code}): {text}"));
             }
             offset += filled as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = offset).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, offset);
         }
         Ok(())
     }
@@ -2704,7 +2682,6 @@ impl TransferManager {
         session: Arc<GDriveSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         use futures::StreamExt;
 
@@ -2724,19 +2701,12 @@ impl TransferManager {
             .with_context(|| format!("create {}", local_path.display()))?;
         let mut stream = resp.bytes_stream();
         let mut transferred: u64 = 0;
-        let mut last_emit = Instant::now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("drive chunk for {remote_path}"))?;
             self.checkpoint(id, chunk.len() as u64).await?;
             file.write_all(&chunk).await?;
             transferred += chunk.len() as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = transferred).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, transferred);
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
@@ -2751,7 +2721,6 @@ impl TransferManager {
         session: Arc<GDriveSession>,
         local_path: &Path,
         remote_path: &str,
-        _app: &AppHandle,
     ) -> Result<u64> {
         use crate::session::gdrive::{basename, normalize, parent_of};
 
@@ -2832,7 +2801,6 @@ impl TransferManager {
         session: Arc<BoxSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
     ) -> Result<u64> {
         use futures::StreamExt;
 
@@ -2852,19 +2820,12 @@ impl TransferManager {
             .with_context(|| format!("create {}", local_path.display()))?;
         let mut stream = resp.bytes_stream();
         let mut transferred: u64 = 0;
-        let mut last_emit = Instant::now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("box chunk for {remote_path}"))?;
             self.checkpoint(id, chunk.len() as u64).await?;
             file.write_all(&chunk).await?;
             transferred += chunk.len() as u64;
-            if last_emit.elapsed() > Duration::from_millis(100) {
-                self.update(id, |t| t.transferred = transferred).await;
-                if let Some(t) = self.get(id).await {
-                    let _ = app.emit("transfer://progress", &t);
-                }
-                last_emit = Instant::now();
-            }
+            self.progress(id, transferred);
         }
         file.flush().await?;
         self.update(id, |t| t.transferred = transferred).await;
@@ -2879,7 +2840,6 @@ impl TransferManager {
         session: Arc<BoxSession>,
         local_path: &Path,
         remote_path: &str,
-        _app: &AppHandle,
     ) -> Result<u64> {
         use crate::session::boxdrive::{basename, normalize, parent_of};
 
@@ -3381,6 +3341,12 @@ async fn run_job(mgr: Arc<TransferManager>, id: String, job: RetryInfo) {
             return;
         };
         loop {
+            // A fresh run counts from its start offset (0 until resume).
+            {
+                let live = mgr.live(&id);
+                live.set(0);
+                live.ring.lock().expect("speed ring poisoned").reset();
+            }
             let attempt = match &job {
                 RetryInfo::Download {
                     session,
@@ -3437,62 +3403,58 @@ async fn dispatch_download(
     remote_path: &str,
     final_path: &Path,
 ) -> Result<u64> {
-    let app = mgr
-        .app
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("transfer manager has no app handle"))?;
     match &**session {
         Session::Ssh(ssh) => {
-            mgr.run_ssh_download(id, ssh.clone(), remote_path, final_path, app)
+            mgr.run_ssh_download(id, ssh.clone(), remote_path, final_path)
                 .await
         }
         Session::Ftp(ftp) => {
-            mgr.run_ftp_download(id, ftp.clone(), remote_path, final_path, Some(app))
+            mgr.run_ftp_download(id, ftp.clone(), remote_path, final_path)
                 .await
         }
         Session::Object(obj) => {
-            mgr.run_object_download(id, obj.clone(), remote_path, final_path, app)
+            mgr.run_object_download(id, obj.clone(), remote_path, final_path)
                 .await
         }
         Session::Webdav(dav) => {
-            mgr.run_webdav_download(id, dav.clone(), remote_path, final_path, app)
+            mgr.run_webdav_download(id, dav.clone(), remote_path, final_path)
                 .await
         }
         Session::Http(http) => {
-            mgr.run_http_download(id, http.clone(), remote_path, final_path, app)
+            mgr.run_http_download(id, http.clone(), remote_path, final_path)
                 .await
         }
         Session::Dropbox(dbx) => {
-            mgr.run_dropbox_download(id, dbx.clone(), remote_path, final_path, app)
+            mgr.run_dropbox_download(id, dbx.clone(), remote_path, final_path)
                 .await
         }
         Session::OneDrive(od) => {
-            mgr.run_onedrive_download(id, od.clone(), remote_path, final_path, app)
+            mgr.run_onedrive_download(id, od.clone(), remote_path, final_path)
                 .await
         }
         Session::GDrive(gd) => {
-            mgr.run_gdrive_download(id, gd.clone(), remote_path, final_path, app)
+            mgr.run_gdrive_download(id, gd.clone(), remote_path, final_path)
                 .await
         }
         Session::Box(bx) => {
-            mgr.run_box_download(id, bx.clone(), remote_path, final_path, app)
+            mgr.run_box_download(id, bx.clone(), remote_path, final_path)
                 .await
         }
         Session::Shopify(sh) => {
-            mgr.run_shopify_download(id, sh.clone(), remote_path, final_path, app)
+            mgr.run_shopify_download(id, sh.clone(), remote_path, final_path)
                 .await
         }
         Session::HubSpot(hs) => {
-            mgr.run_hubspot_download(id, hs.clone(), remote_path, final_path, app)
+            mgr.run_hubspot_download(id, hs.clone(), remote_path, final_path)
                 .await
         }
         Session::Dynamics(dynm) => {
-            mgr.run_dynamics_download(id, dynm.clone(), remote_path, final_path, app)
+            mgr.run_dynamics_download(id, dynm.clone(), remote_path, final_path)
                 .await
         }
         Session::Agent(agent) => {
             debug_assert!(supports_delta(session));
-            mgr.run_agent_download_with_delta(id, agent.clone(), remote_path, final_path, app)
+            mgr.run_agent_download_with_delta(id, agent.clone(), remote_path, final_path)
                 .await
         }
     }
@@ -3506,61 +3468,57 @@ async fn dispatch_upload(
     local: &Path,
     final_remote: &str,
 ) -> Result<u64> {
-    let app = mgr
-        .app
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("transfer manager has no app handle"))?;
     match &**session {
         Session::Ssh(ssh) => {
-            mgr.run_ssh_upload(id, ssh.clone(), local, final_remote, app)
+            mgr.run_ssh_upload(id, ssh.clone(), local, final_remote)
                 .await
         }
         Session::Ftp(ftp) => {
-            mgr.run_ftp_upload(id, ftp.clone(), local, final_remote, Some(app))
+            mgr.run_ftp_upload(id, ftp.clone(), local, final_remote)
                 .await
         }
         Session::Object(obj) => {
-            mgr.run_object_upload(id, obj.clone(), local, final_remote, app)
+            mgr.run_object_upload(id, obj.clone(), local, final_remote)
                 .await
         }
         Session::Webdav(dav) => {
-            mgr.run_webdav_upload(id, dav.clone(), local, final_remote, app)
+            mgr.run_webdav_upload(id, dav.clone(), local, final_remote)
                 .await
         }
         Session::Http(_) => Err(anyhow::anyhow!(
             "HTTP source is read-only — upload not supported"
         )),
         Session::Dropbox(dbx) => {
-            mgr.run_dropbox_upload(id, dbx.clone(), local, final_remote, app)
+            mgr.run_dropbox_upload(id, dbx.clone(), local, final_remote)
                 .await
         }
         Session::OneDrive(od) => {
-            mgr.run_onedrive_upload(id, od.clone(), local, final_remote, app)
+            mgr.run_onedrive_upload(id, od.clone(), local, final_remote)
                 .await
         }
         Session::GDrive(gd) => {
-            mgr.run_gdrive_upload(id, gd.clone(), local, final_remote, app)
+            mgr.run_gdrive_upload(id, gd.clone(), local, final_remote)
                 .await
         }
         Session::Box(bx) => {
-            mgr.run_box_upload(id, bx.clone(), local, final_remote, app)
+            mgr.run_box_upload(id, bx.clone(), local, final_remote)
                 .await
         }
         Session::Shopify(sh) => {
-            mgr.run_shopify_upload(id, sh.clone(), local, final_remote, app)
+            mgr.run_shopify_upload(id, sh.clone(), local, final_remote)
                 .await
         }
         Session::HubSpot(hs) => {
-            mgr.run_hubspot_upload(id, hs.clone(), local, final_remote, app)
+            mgr.run_hubspot_upload(id, hs.clone(), local, final_remote)
                 .await
         }
         Session::Dynamics(dynm) => {
-            mgr.run_dynamics_upload(id, dynm.clone(), local, final_remote, app)
+            mgr.run_dynamics_upload(id, dynm.clone(), local, final_remote)
                 .await
         }
         Session::Agent(agent) => {
             debug_assert!(supports_delta(session));
-            mgr.run_agent_upload_with_delta(id, agent.clone(), local, final_remote, app)
+            mgr.run_agent_upload_with_delta(id, agent.clone(), local, final_remote)
                 .await
         }
     }
@@ -3588,6 +3546,7 @@ async fn finalize(mgr: &Arc<TransferManager>, id: &str, result: Result<u64>) {
         Ok(written) => {
             mgr.update(id, |t| {
                 t.status = TransferStatus::Done;
+                t.settle();
                 t.size = written;
                 t.transferred = written;
                 t.error = None;
@@ -3601,6 +3560,7 @@ async fn finalize(mgr: &Arc<TransferManager>, id: &str, result: Result<u64>) {
         Err(e) => {
             mgr.update(id, |t| {
                 t.status = TransferStatus::Error;
+                t.settle();
                 t.error = Some(e.to_string());
             })
             .await;
@@ -3610,6 +3570,7 @@ async fn finalize(mgr: &Arc<TransferManager>, id: &str, result: Result<u64>) {
         }
     }
     mgr.tasks.lock().await.remove(id);
+    mgr.drop_live(id);
 }
 
 #[cfg(test)]
@@ -3685,6 +3646,11 @@ mod tests {
             retry_attempt: None,
             delta: None,
             started_at: 0,
+            bytes_per_sec: None,
+            eta_secs: None,
+            segments: None,
+            stalled: false,
+            notice: None,
             resumable: false,
         })
         .await;
@@ -3785,6 +3751,11 @@ mod tests {
                 retry_attempt: None,
                 delta: None,
                 started_at: 0,
+                bytes_per_sec: None,
+                eta_secs: None,
+                segments: None,
+                stalled: false,
+                notice: None,
                 resumable: false,
             })
             .await;
@@ -3995,6 +3966,11 @@ mod tests {
             retry_attempt: None,
             delta: None,
             started_at: 0,
+            bytes_per_sec: None,
+            eta_secs: None,
+            segments: None,
+            stalled: false,
+            notice: None,
             resumable: false,
         })
         .await;
@@ -4119,7 +4095,7 @@ mod tests {
         let session = delta_test_session(false).await;
         // First upload: no remote basis → whole-file.
         let mgr = delta_test_manager("t", TransferKind::Upload, &local.to_string_lossy(), &remote_s, size as u64).await;
-        mgr.agent_upload_with_delta_core("t", &session, &local, &remote_s, None)
+        mgr.agent_upload_with_delta_core("t", &session, &local, &remote_s)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&remote).unwrap(), std::fs::read(&local).unwrap());
@@ -4131,7 +4107,7 @@ mod tests {
             .copy_from_slice(&det_bytes(0xBBBB, 1024));
         std::fs::write(&local, &content).unwrap();
         mgr.update("t", |t| t.transferred = 0).await;
-        mgr.agent_upload_with_delta_core("t", &session, &local, &remote_s, None)
+        mgr.agent_upload_with_delta_core("t", &session, &local, &remote_s)
             .await
             .unwrap();
 
@@ -4172,7 +4148,7 @@ mod tests {
         let session = delta_test_session(false).await;
         // First download: no local basis → whole-file.
         let mgr = delta_test_manager("t", TransferKind::Download, &remote_s, &local.to_string_lossy(), size as u64).await;
-        mgr.agent_download_with_delta_core("t", &session, &remote_s, &local, None)
+        mgr.agent_download_with_delta_core("t", &session, &remote_s, &local)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&local).unwrap(), std::fs::read(&remote).unwrap());
@@ -4184,7 +4160,7 @@ mod tests {
             .copy_from_slice(&det_bytes(0xDDDD, 1024));
         std::fs::write(&remote, &content).unwrap();
         mgr.update("t", |t| t.transferred = 0).await;
-        mgr.agent_download_with_delta_core("t", &session, &remote_s, &local, None)
+        mgr.agent_download_with_delta_core("t", &session, &remote_s, &local)
             .await
             .unwrap();
 
@@ -4219,7 +4195,7 @@ mod tests {
         content[1024..2048].copy_from_slice(&det_bytes(0xFFFF, 1024));
         std::fs::write(&local, &content).unwrap();
         let mgr = delta_test_manager("u", TransferKind::Upload, &local.to_string_lossy(), &remote_s, size as u64).await;
-        mgr.agent_upload_with_delta_core("u", &session, &local, &remote_s, None)
+        mgr.agent_upload_with_delta_core("u", &session, &local, &remote_s)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&remote).unwrap(), content);
@@ -4229,7 +4205,7 @@ mod tests {
         content[4096..5120].copy_from_slice(&det_bytes(0x1234, 1024));
         std::fs::write(&remote, &content).unwrap();
         let mgr = delta_test_manager("d", TransferKind::Download, &remote_s, &local.to_string_lossy(), size as u64).await;
-        mgr.agent_download_with_delta_core("d", &session, &remote_s, &local, None)
+        mgr.agent_download_with_delta_core("d", &session, &remote_s, &local)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&local).unwrap(), content);
@@ -4253,7 +4229,7 @@ mod tests {
 
         let session = delta_test_session(false).await;
         let mgr = delta_test_manager("u", TransferKind::Upload, &local.to_string_lossy(), &remote_s, size as u64).await;
-        mgr.agent_upload_with_delta_core("u", &session, &local, &remote_s, None)
+        mgr.agent_upload_with_delta_core("u", &session, &local, &remote_s)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&remote).unwrap(), std::fs::read(&local).unwrap());
@@ -4262,7 +4238,7 @@ mod tests {
         // Download direction, same setup reversed.
         std::fs::write(&remote, det_bytes(0x9999, size)).unwrap();
         let mgr = delta_test_manager("d", TransferKind::Download, &remote_s, &local.to_string_lossy(), size as u64).await;
-        mgr.agent_download_with_delta_core("d", &session, &remote_s, &local, None)
+        mgr.agent_download_with_delta_core("d", &session, &remote_s, &local)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&local).unwrap(), std::fs::read(&remote).unwrap());
