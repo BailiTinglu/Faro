@@ -62,6 +62,8 @@ fn profile(protocol: &str, host: &str, port: u16, user: &str, pass: &str) -> Con
         jump_username: None,
         ftp_encoding: None,
         ftp_active_mode: None,
+        ftp_max_connections: None,
+        ftp_segments: None,
     }
 }
 
@@ -481,6 +483,82 @@ async fn live_http_ranged_download() {
     assert_eq!(std::fs::read(&got).unwrap(), want.to_vec());
     println!("HTTP download: {:.1} MiB/s, peak segments {peak}", mbps(t.size, took));
     assert!(peak > 1, "Range requests ran in parallel");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Plan 24 Phase 8: a download copies on its own login, so listing a folder
+/// on the browsing connection doesn't wait behind it; and a server that
+/// caps logins (the test vsftpd allows 3 per IP) only lowers the number of
+/// parallel connections — the download still finishes intact.
+#[tokio::test]
+#[ignore]
+async fn live_ftp_browse_during_download_and_login_cap() {
+    let Some(v) = env("FARO_LIVE_FTP") else { return };
+    let mut p = profile("ftp", &v[0], v[1].parse().unwrap(), &v[2], &v[3]);
+    p.ftp_max_connections = Some(8);
+    p.ftp_segments = Some(4);
+    let ftp = Arc::new(
+        crate::session::ftp::ftp_connect(&p, Arc::new(AcceptAll))
+            .await
+            .expect("ftp connect"),
+    );
+    let session = Arc::new(Session::Ftp(Arc::clone(&ftp)));
+    let dir = scratch("ftp-pool");
+    let mgr = Arc::new(TransferManager::new());
+    let remote = "/home/faro/data/big.bin";
+    let size = remote_size(&session, remote).await.unwrap();
+    let target = dir.join("big.bin");
+    let id = "ftp-pool".to_string();
+    mgr.insert(row(&id, TransferKind::Download, remote, &target.to_string_lossy(), size)).await;
+    mgr.pauses.lock().await.insert(id.clone(), PauseGate::new());
+    mgr.waiting.lock().await.push_back(id.clone());
+    // Slow enough to be mid-copy while we browse, and to be worth splitting.
+    mgr.set_throttle_kbps(16 * 1024);
+    let task = tokio::spawn(run_job(
+        Arc::clone(&mgr),
+        id.clone(),
+        RetryInfo::Download {
+            session: Arc::clone(&session),
+            remote_path: remote.into(),
+            target: target.clone(),
+            policy: OverwritePolicy::Overwrite,
+        },
+    ));
+    while mgr.live(&id).get() < 32 * 1024 * 1024 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let fs = crate::remotefs::ftp::FtpFs::new(Arc::clone(&ftp));
+    let started = Instant::now();
+    let listing = crate::remotefs::RemoteFs::list_dir(&fs, "/home/faro/data").await.unwrap();
+    let browse = started.elapsed();
+    assert!(listing.iter().any(|e| e.name == "big.bin"));
+    println!("FTP: listed a folder in {browse:?} during a running download");
+    assert!(browse < Duration::from_secs(3), "browsing waited behind the copy: {browse:?}");
+    let mut peak = 0;
+    while !task.is_finished() {
+        peak = peak.max(mgr.live(&id).segments.load(Ordering::Relaxed));
+        if mgr.live(&id).get() > size / 2 {
+            mgr.set_throttle_kbps(0);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let t = mgr.get(&id).await.unwrap();
+    assert_eq!(t.status, TransferStatus::Done, "{:?}", t.error);
+    let want = {
+        let Session::Ftp(f) = &*session else { unreachable!() };
+        let _ = f;
+        // Compare against the same file fetched over SFTP-free means: the
+        // server's own copy via a plain single-connection download.
+        let check = scratch("ftp-check");
+        let mgr2 = Arc::new(TransferManager::new());
+        let (t2, ..) = download(&mgr2, &ftp_session().await.unwrap(), remote, &check).await;
+        assert_eq!(t2.status, TransferStatus::Done);
+        let h = sha_file(&check.join("big.bin"));
+        let _ = std::fs::remove_dir_all(&check);
+        h
+    };
+    assert_eq!(sha_file(&target), want);
+    println!("FTP: segmented download under a 3-login cap finished intact (peak {peak} connections)");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

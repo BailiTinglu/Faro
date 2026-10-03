@@ -191,6 +191,9 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
   // FTP-only: path-name character set ("" = auto).
   const [ftpEncoding, setFtpEncoding] = useState(seed?.ftpEncoding ?? "");
   const [ftpActiveMode, setFtpActiveMode] = useState(seed?.ftpActiveMode ?? false);
+  // FTP-only: transfer connections (pool) and connections per download.
+  const [ftpMaxConnections, setFtpMaxConnections] = useState(seed?.ftpMaxConnections ?? 2);
+  const [ftpSegments, setFtpSegments] = useState(seed?.ftpSegments ?? 1);
   const [group, setGroup] = useState(seed?.group ?? "");
   // Custom rail bubble glyph: emoji/short string, or a bundled Iconify key
   // (picked via the IconPicker grid; custom keys still possible via search).
@@ -460,6 +463,8 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
       jumpUsername: profile?.jumpUsername,
       ftpEncoding: isFtp ? ftpEncoding || undefined : undefined,
       ftpActiveMode: isFtp && ftpActiveMode ? true : undefined,
+      ftpMaxConnections: isFtp && ftpMaxConnections !== 2 ? ftpMaxConnections : undefined,
+      ftpSegments: isFtp && ftpSegments !== 1 ? ftpSegments : undefined,
     };
   };
 
@@ -952,6 +957,38 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
               >
                 <option value="passive">Passive</option>
                 <option value="active">Active</option>
+              </select>
+            </Field>
+          </div>
+        )}
+        {isFtp && (
+          <div className="flex gap-2">
+            <Field label="Transfer connections" className="flex-1">
+              <select
+                value={ftpMaxConnections}
+                onChange={(e) => setFtpMaxConnections(Number(e.target.value))}
+                className={inputCls}
+                title="Extra logins used for copying, so browsing never waits behind a transfer. Faro uses fewer if the server refuses more."
+              >
+                {[1, 2, 3, 4, 6, 8].map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Connections per file" className="flex-1">
+              <select
+                value={ftpSegments}
+                onChange={(e) => setFtpSegments(Number(e.target.value))}
+                className={inputCls}
+                title="Split one large download across several logins. Many servers limit logins per user; keep 1 unless yours allows more."
+              >
+                {[1, 2, 3, 4].map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
               </select>
             </Field>
           </div>

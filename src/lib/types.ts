@@ -105,6 +105,11 @@ export interface ConnectionProfile {
   ftpEncoding?: string;
   /** FTP/FTPS: open data connections in active (PORT) mode. Absent = passive. */
   ftpActiveMode?: boolean;
+  /** FTP/FTPS: logged-in connections kept for transfers, separate from
+   *  browsing (Plan 24). Absent = 2. */
+  ftpMaxConnections?: number;
+  /** FTP/FTPS: parallel connections one download may use. Absent = 1. */
+  ftpSegments?: number;
 }
 
 export const PROTOCOL_DEFAULT_PORT: Record<Protocol, number> = {

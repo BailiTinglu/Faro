@@ -595,6 +595,8 @@ mod tests {
             jump_username: None,
             ftp_encoding: None,
             ftp_active_mode: None,
+            ftp_max_connections: None,
+            ftp_segments: None,
         };
 
         // Client-credentials blob: tenant:client_id:client_secret.

@@ -321,6 +321,8 @@ mod tests {
             jump_username: None,
             ftp_encoding: None,
             ftp_active_mode: None,
+            ftp_max_connections: None,
+            ftp_segments: None,
         };
         let session = Arc::new(onedrive_connect(&profile).await.expect("connect"));
 

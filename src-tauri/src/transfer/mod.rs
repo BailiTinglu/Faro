@@ -2801,7 +2801,7 @@ impl TransferManager {
         let (gate, rx, ack) = FtpGate::new();
         let local = local_path.to_path_buf();
         let remote = remote_path.to_string();
-        let copy = session.with_stream(move |stream| {
+        let copy = session.with_transfer_stream(move |stream| {
             let mut file = std::fs::File::open(&local)
                 .with_context(|| format!("open {}", local.display()))?;
             let local_len = file.metadata()?.len();
@@ -4422,6 +4422,8 @@ mod tests {
             jump_username: None,
             ftp_encoding: None,
             ftp_active_mode: None,
+            ftp_max_connections: None,
+            ftp_segments: None,
         }
     }
 
