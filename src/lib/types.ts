@@ -105,6 +105,11 @@ export interface ConnectionProfile {
   ftpEncoding?: string;
   /** FTP/FTPS: open data connections in active (PORT) mode. Absent = passive. */
   ftpActiveMode?: boolean;
+  /** FTP/FTPS: logged-in connections kept for transfers, separate from
+   *  browsing (Plan 24). Absent = 2. */
+  ftpMaxConnections?: number;
+  /** FTP/FTPS: parallel connections one download may use. Absent = 1. */
+  ftpSegments?: number;
 }
 
 export const PROTOCOL_DEFAULT_PORT: Record<Protocol, number> = {
@@ -1119,6 +1124,19 @@ export interface Transfer {
    *  persists on done transfers. */
   delta?: { sent: number; reused: number };
   startedAt: number;
+  /** Moving-average speed over the last ~10 s (Plan 24), while transferring. */
+  bytesPerSec?: number;
+  /** Seconds left at the current speed; absent when unknown. */
+  etaSecs?: number;
+  /** Parallel ranges/parts in flight (segmented transfers). */
+  segments?: number;
+  /** No bytes have moved for a few seconds ("not responding"). */
+  stalled?: boolean;
+  /** One-line note about the run, e.g. "remote changed, restarted". */
+  notice?: string;
+  /** Unfinished transfer restored from the last session (Plan 24): Paused,
+   *  resumable once its connection is open. */
+  restored?: boolean;
 }
 
 /** Live transfer-queue snapshot (Plan 17) — payload of `transfer://queue` and

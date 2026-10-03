@@ -187,6 +187,35 @@ export function Settings({ onClose }: Props) {
                 suffix="KiB/s"
               />
             </Field>
+            <Field
+              label="Connections per file"
+              help="Large downloads and object-store uploads are split across parallel connections. Auto starts with one and adds more while it helps; 1 turns splitting off."
+            >
+              <div className="flex items-center gap-2">
+                <Segmented<"auto" | "manual">
+                  value={s.transferSegments === "auto" ? "auto" : "manual"}
+                  onChange={(v) => s.setTransferSegments(v === "auto" ? "auto" : 4)}
+                  options={[
+                    { value: "auto", label: "Auto" },
+                    { value: "manual", label: "Fixed" },
+                  ]}
+                />
+                {s.transferSegments !== "auto" && (
+                  <NumberInput
+                    min={1}
+                    max={16}
+                    value={s.transferSegments}
+                    onChange={(n) => s.setTransferSegments(n)}
+                  />
+                )}
+              </div>
+            </Field>
+            <ToggleField
+              label="Verify transfers with a checksum"
+              help="After a transfer, compare a checksum with the server where it can provide one (S3-style ETags, sha256sum over SSH). Slower; a mismatch keeps the temporary file and marks the transfer failed."
+              checked={s.transferVerify}
+              onChange={s.setTransferVerify}
+            />
             <ToggleField
               label="Delta sync (send only changed blocks)"
               help="Re-transferring a changed file sends just the differing blocks instead of the whole file. Only for Faro Agent connections, files ≥ 8 MB."

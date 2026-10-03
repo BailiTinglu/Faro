@@ -18,7 +18,7 @@ import {
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useSettings } from "@/stores/settingsStore";
 import { useSync } from "@/stores/syncStore";
-import { onTransferEvent, onEditError } from "@/lib/ipc";
+import { onTransferEvent, onTransferProgressBatch, onEditError } from "@/lib/ipc";
 import { useLayout } from "@/stores/layoutStore";
 import { useTransfers } from "@/stores/transfersStore";
 
@@ -122,17 +122,20 @@ export function initNotifications(): () => void {
     }
   };
 
+  const enter = (id: string) => {
+    if (!active.has(id)) {
+      active.add(id);
+      batchTotal++;
+    }
+  };
+  // Progress also catches a transfer whose `added` we missed (listener
+  // attached mid-flight).
+  track(onTransferProgressBatch((ts) => ts.forEach((t) => enter(t.id))));
   track(onTransferEvent((kind, t) => {
     const id = t.id;
     switch (kind) {
       case "added":
-      case "progress":
-        // `added` is the entry point; `progress` also catches a transfer whose
-        // `added` we missed (listener attached mid-flight).
-        if (!active.has(id)) {
-          active.add(id);
-          batchTotal++;
-        }
+        enter(id);
         break;
       case "done":
         if (active.delete(id)) {

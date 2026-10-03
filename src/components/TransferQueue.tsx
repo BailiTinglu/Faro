@@ -14,6 +14,7 @@ import {
 import { useTransfers } from "@/stores/transfersStore";
 import type { Transfer } from "@/lib/types";
 import { cn } from "@/lib/cn";
+import { fmtEta, fmtRate } from "@/lib/format";
 
 export function TransferQueue() {
   const {
@@ -54,6 +55,10 @@ export function TransferQueue() {
     (t) => t.status === "transferring" || t.status === "paused"
   ).length;
   const queued = queue.length;
+  const totalSpeed = transfers.reduce(
+    (sum, t) => sum + (t.status === "transferring" ? t.bytesPerSec ?? 0 : 0),
+    0
+  );
 
   return (
     <div className="anim-slide-up flex max-h-64 flex-col border-t border-border bg-bg-panel">
@@ -64,6 +69,11 @@ export function TransferQueue() {
         {(active > 0 || queued > 0) && (
           <span className="rounded bg-accent/20 px-1.5 py-0.5 text-[10px] font-medium text-accent">
             {active} active · {queued} queued
+          </span>
+        )}
+        {totalSpeed > 0 && (
+          <span className="text-[11px] text-text-muted" title="Combined speed of running transfers">
+            {fmtRate(totalSpeed)}
           </span>
         )}
         <div className="flex-1" />
@@ -181,8 +191,11 @@ function Row({
   const retrying = t.retryAttempt !== undefined && !!t.error;
   const queuePos = queue.indexOf(t.id);
 
+  const stalled = t.status === "transferring" && !!t.stalled;
   const statusLabel =
-    t.status === "transferring"
+    stalled
+      ? "not responding"
+      : t.status === "transferring"
       ? `${pct.toFixed(0)}%`
       : t.status === "done"
         ? "done"
@@ -210,6 +223,14 @@ function Row({
           → {t.destination}
         </div>
         {t.delta && <DeltaBadge delta={t.delta} />}
+        {t.notice && (
+          <div className="mt-0.5 text-[11px] text-warning">{t.notice}</div>
+        )}
+        {t.restored && (
+          <div className="mt-0.5 text-[11px] text-text-dim">
+            Unfinished from your last session. Open its connection, then resume.
+          </div>
+        )}
         {t.status === "transferring" && (
           <div className="mt-1 h-1 w-full overflow-hidden rounded bg-bg-subtle">
             <div
@@ -229,9 +250,22 @@ function Row({
           </div>
         )}
       </div>
-      <div className="w-20 shrink-0 text-right text-[11px] text-text-muted">
+      <div className="w-24 shrink-0 text-right text-[11px] text-text-muted">
         <div>{fmtSize(t.transferred)}</div>
-        <div className="text-text-dim">{statusLabel}</div>
+        {t.status === "transferring" && !stalled && t.bytesPerSec !== undefined && (
+          <div
+            className="text-text-dim"
+            title={
+              t.segments && t.segments > 1
+                ? `${t.segments} parallel connections`
+                : undefined
+            }
+          >
+            {fmtRate(t.bytesPerSec)}
+            {t.etaSecs !== undefined && ` · ${fmtEta(t.etaSecs)}`}
+          </div>
+        )}
+        <div className={stalled ? "text-warning" : "text-text-dim"}>{statusLabel}</div>
       </div>
       {t.status === "queued" && queuePos >= 0 && (
         <>
@@ -266,7 +300,7 @@ function Row({
         <button
           onClick={onResume}
           className="rounded p-1 text-text-muted hover:bg-bg-hover hover:text-text"
-          title="Resume (restarts from byte 0)"
+          title="Resume"
         >
           <Play size={12} />
         </button>

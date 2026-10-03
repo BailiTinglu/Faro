@@ -272,6 +272,13 @@ export const ipc = {
   transferSetDeltaSync: (enabled: boolean) =>
     invoke<void>("transfer_set_delta_sync", { enabled }),
 
+  /** Max parallel ranges/parts per file; 0 = auto (Plan 24). */
+  transferSetSegments: (count: number) =>
+    invoke<void>("transfer_set_segments", { count }),
+
+  transferSetVerify: (enabled: boolean) =>
+    invoke<void>("transfer_set_verify", { enabled }),
+
   transferQueueState: () => invoke<TransferQueueState>("transfer_queue_state"),
 
   startDirectoryDownload: (
@@ -746,13 +753,12 @@ export async function onSearchEvent(
 
 export async function onTransferEvent(
   cb: (
-    kind: "added" | "progress" | "done" | "error" | "updated",
+    kind: "added" | "done" | "error" | "updated",
     t: Transfer
   ) => void
 ): Promise<UnlistenFn> {
   const unsubs = await Promise.all([
     listen<Transfer>("transfer://added", (e) => cb("added", e.payload)),
-    listen<Transfer>("transfer://progress", (e) => cb("progress", e.payload)),
     listen<Transfer>("transfer://done", (e) => cb("done", e.payload)),
     listen<Transfer>("transfer://error", (e) => cb("error", e.payload)),
     listen<Transfer>("transfer://updated", (e) => cb("updated", e.payload)),
@@ -760,6 +766,14 @@ export async function onTransferEvent(
   return () => {
     unsubs.forEach((u) => u());
   };
+}
+
+/** Batched progress (Plan 24): one event every 250 ms carrying every running
+ *  transfer whose bytes, speed or state changed. */
+export async function onTransferProgressBatch(
+  cb: (transfers: Transfer[]) => void
+): Promise<UnlistenFn> {
+  return listen<Transfer[]>("transfer://progress-batch", (e) => cb(e.payload));
 }
 
 export async function onTransferQueue(

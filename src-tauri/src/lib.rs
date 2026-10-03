@@ -262,6 +262,13 @@ pub fn run() {
             // those values.
             {
                 let st = app.state::<AppState>();
+                st.transfers.set_app(app.handle());
+                st.transfers.set_db(st.db.clone());
+                st.transfers.start_ticker();
+                // Unfinished transfers from the last run come back as Paused
+                // rows with a Resume action (Plan 24 Phase 4).
+                let transfers = st.transfers.clone();
+                tauri::async_runtime::block_on(transfers.restore());
                 if let Ok(Some(raw)) = st.db.settings_get("transferConcurrency") {
                     if let Ok(n) = serde_json::from_str::<usize>(&raw) {
                         st.transfers.set_concurrency(n);
@@ -277,6 +284,18 @@ pub fn run() {
                 if let Ok(Some(raw)) = st.db.settings_get("deltaSync") {
                     if let Ok(on) = serde_json::from_str::<bool>(&raw) {
                         st.transfers.set_delta_enabled(on);
+                    }
+                }
+                // Plan 24: `transferSegments` ("auto" or 1–16) and
+                // `transferVerify`. Absent rows keep the defaults (auto, off).
+                if let Ok(Some(raw)) = st.db.settings_get("transferSegments") {
+                    if let Ok(n) = serde_json::from_str::<usize>(&raw) {
+                        st.transfers.set_segments(Some(n));
+                    }
+                }
+                if let Ok(Some(raw)) = st.db.settings_get("transferVerify") {
+                    if let Ok(on) = serde_json::from_str::<bool>(&raw) {
+                        st.transfers.set_verify(on);
                     }
                 }
             }
@@ -437,6 +456,8 @@ pub fn run() {
             commands::transfer_resume_all,
             commands::transfer_set_concurrency,
             commands::transfer_set_throttle,
+            commands::transfer_set_segments,
+            commands::transfer_set_verify,
             commands::transfer_set_delta_sync,
             commands::transfer_queue_state,
             commands::rename_path,

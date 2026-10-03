@@ -461,6 +461,13 @@ impl client::Handler for ClientHandler {
     }
 }
 
+/// A dedicated raw SFTP channel for one transfer, with the server's
+/// `limits@openssh.com` answer when it gave one.
+pub struct RawSftpChannel {
+    pub raw: russh_sftp::client::RawSftpSession,
+    pub limits: Option<russh_sftp::client::rawsession::Limits>,
+}
+
 // ---- SshSession ----
 //
 // One TCP/SSH connection, shared between the SFTP browser and any number of
@@ -560,6 +567,58 @@ impl SshSession {
         let sftp = Arc::new(Mutex::new(SftpSession::new(channel.into_stream()).await?));
         let mut slot = self.sftp.lock().await;
         Ok(slot.get_or_insert(sftp).clone())
+    }
+
+    /// Open a dedicated SFTP channel for one transfer (Plan 24), separate
+    /// from the shared browsing session so a download's pipelined reads
+    /// neither queue behind directory listings nor share its channel window.
+    /// Negotiates `limits@openssh.com` when offered. The request timeout is
+    /// generous because dozens of reads are in flight at once; the transfer
+    /// engine's stall watchdog catches a channel that stops moving.
+    pub async fn open_raw_sftp_channel(&self) -> Result<RawSftpChannel> {
+        self.with_reconnect(|| async move {
+            let channel = {
+                let h = self.handle.lock().await;
+                h.channel_open_session().await?
+            };
+            channel.request_subsystem(true, "sftp").await?;
+            let mut raw = russh_sftp::client::RawSftpSession::new(channel.into_stream());
+            raw.set_timeout(120);
+            let version = raw.init().await?;
+            let mut limits = None;
+            if version
+                .extensions
+                .get(russh_sftp::extensions::LIMITS)
+                .is_some_and(|v| v == "1")
+            {
+                if let Ok(l) = raw.limits().await {
+                    let l: russh_sftp::client::rawsession::Limits = l.into();
+                    raw.set_limits(l);
+                    limits = Some(l);
+                }
+            }
+            Ok(RawSftpChannel { raw, limits })
+        })
+        .await
+    }
+
+    /// A dedicated high-level SFTP session for one upload (Plan 24): up to
+    /// 32 writes in flight instead of the default 8.
+    pub async fn open_upload_sftp(&self) -> Result<SftpSession> {
+        self.with_reconnect(|| async move {
+            let channel = {
+                let h = self.handle.lock().await;
+                h.channel_open_session().await?
+            };
+            channel.request_subsystem(true, "sftp").await?;
+            let cfg = russh_sftp::client::Config {
+                max_concurrent_writes: 32,
+                request_timeout_secs: 120,
+                ..Default::default()
+            };
+            Ok(SftpSession::new_with_config(channel.into_stream(), cfg).await?)
+        })
+        .await
     }
 
     /// Open a fresh exec channel for `command`, reconnecting once if the
@@ -1821,6 +1880,17 @@ impl SessionManager {
 
     pub async fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.sessions.lock().await.get(id).cloned()
+    }
+
+    /// An open session for the saved connection `profile_id`, if any (a
+    /// transfer restored from an earlier run resumes on it).
+    pub async fn find_by_profile(&self, profile_id: &str) -> Option<Arc<Session>> {
+        self.sessions
+            .lock()
+            .await
+            .values()
+            .find(|s| s.profile().id == profile_id)
+            .cloned()
     }
 
     /// Convenience accessor when the caller specifically needs an SSH session

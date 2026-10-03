@@ -4,7 +4,7 @@ use crate::tls_trust;
 use anyhow::{anyhow, Context, Result};
 use encoding_rs::{Encoding, UTF_8, WINDOWS_1252};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -25,9 +25,10 @@ const IO_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One FTP control connection. suppaftp is synchronous; we wrap it in a
 /// `std::sync::Mutex` and route every operation through `spawn_blocking` so
-/// it cannot block tokio's runtime threads. Data transfers go through the
-/// same stream (FTP has no native multiplexing — operations serialise on the
-/// control connection by design).
+/// it cannot block tokio's runtime threads. FTP has no multiplexing, so
+/// transfers copy on their own logged-in connections from a small pool
+/// (Plan 24 Phase 8) and browsing never waits behind a copy; the control
+/// connection is the fallback when the server allows no extra logins.
 ///
 /// If an operation loses the control connection (timeout, reset, server
 /// restart), the session reconnects transparently before the next one.
@@ -45,6 +46,74 @@ pub struct FtpSession {
     /// What auto charset detection settled on; outlives reconnects so a
     /// reconnected session keeps addressing non-ASCII paths correctly.
     detected_charset: Arc<AtomicU8>,
+    /// Logged-in connections for transfers (Plan 24 Phase 8).
+    pool: Arc<TransferPool>,
+}
+
+/// A few extra logged-in connections that transfers check out, so a copy
+/// never holds the browsing connection. The cap starts at the profile's
+/// `ftp_max_connections` (default 2) and drops when the server refuses a
+/// login (`421` too many connections, `530`), the same way the ranged
+/// download driver backs off its connection count.
+struct TransferPool {
+    idle: StdMutex<Vec<FtpStreamKind>>,
+    /// Connections checked out right now.
+    out: AtomicUsize,
+    cap: AtomicUsize,
+    returned: tokio::sync::Notify,
+}
+
+impl TransferPool {
+    fn new(cap: usize) -> Self {
+        Self {
+            idle: StdMutex::new(Vec::new()),
+            out: AtomicUsize::new(0),
+            cap: AtomicUsize::new(cap.max(1)),
+            returned: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn give_back(&self, conn: Option<FtpStreamKind>) {
+        if let (Some(c), Ok(mut idle)) = (conn, self.idle.lock()) {
+            idle.push(c);
+        }
+        self.out.fetch_sub(1, Ordering::AcqRel);
+        self.returned.notify_one();
+    }
+}
+
+/// Gives a checked-out slot back if the transfer is dropped (canceled)
+/// before its connection reaches the blocking copy, which returns it itself.
+struct SlotGuard(Option<Arc<TransferPool>>);
+
+impl SlotGuard {
+    fn defuse(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if let Some(pool) = self.0.take() {
+            pool.give_back(None);
+        }
+    }
+}
+
+/// What a checkout got: a pooled connection, or the right to open one.
+enum Slot {
+    Idle(FtpStreamKind),
+    New,
+}
+
+/// Did the server refuse a login because of a connection limit?
+fn refused_login(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<FtpError>(),
+            Some(FtpError::UnexpectedResponse(r)) if matches!(r.status.code(), 421 | 530)
+        )
+    })
 }
 
 /// suppaftp has one stream type per TLS backend. We keep them in an enum so
@@ -140,6 +209,65 @@ impl FtpStreamKind {
             Ok(copied)
         })
     }
+    /// Download `[offset, offset + len)` of `path` (`REST` + `RETR`), handing
+    /// each block to `emit` until `len` bytes went by, EOF, or `emit` returns
+    /// false. Stopping before EOF sends `ABOR`; if the server answers that
+    /// in a way suppaftp doesn't expect, the error is reported as a lost
+    /// connection so the session reconnects instead of reading out of step.
+    /// Returns the bytes emitted.
+    pub fn retr_range(
+        &mut self,
+        path: &str,
+        offset: u64,
+        len: u64,
+        mut emit: impl FnMut(&[u8]) -> bool,
+    ) -> Result<u64> {
+        use std::io::Read;
+        let lost = |e: FtpError| {
+            into_anyhow(FtpError::ConnectionError(std::io::Error::other(e.to_string())))
+        };
+        each!(self, s => {
+            if offset > 0 {
+                s.resume_transfer(offset as usize)
+                    .map_err(into_anyhow)
+                    .context("server refused REST (resume)")?;
+            }
+            let mut data = s.retr_as_stream(path).map_err(into_anyhow)?;
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut got = 0u64;
+            let mut early = false;
+            loop {
+                let want = buf.len().min(len.saturating_sub(got).min(usize::MAX as u64) as usize);
+                if want == 0 {
+                    // Got everything asked for: is the server done too?
+                    let mut probe = [0u8; 1];
+                    early = !matches!(data.read(&mut probe), Ok(0));
+                    break;
+                }
+                let n = data
+                    .read(&mut buf[..want])
+                    .map_err(|e| into_anyhow(FtpError::ConnectionError(e)))?;
+                if n == 0 {
+                    break;
+                }
+                got += n as u64;
+                if !emit(&buf[..n]) {
+                    early = true;
+                    break;
+                }
+            }
+            if early {
+                s.abort(data).map_err(lost)?;
+            } else {
+                s.finalize_retr_stream(data).map_err(into_anyhow)?;
+            }
+            Ok(got)
+        })
+    }
+    /// Last-modified time (`MDTM`) as Unix seconds.
+    pub fn mdtm_secs(&mut self, path: &str) -> Result<i64> {
+        each!(self, s => s.mdtm(path).map(|t| t.and_utc().timestamp()).map_err(into_anyhow))
+    }
     /// `REST <offset>`: make the next `RETR` start `offset` bytes in.
     pub fn restart_at(&mut self, offset: u64) -> Result<()> {
         each!(self, s => s.resume_transfer(offset as usize).map_err(into_anyhow))
@@ -165,6 +293,9 @@ impl FtpStreamKind {
     }
     pub fn quit(&mut self) {
         let _ = each!(self, s => s.quit());
+    }
+    fn noop(&mut self) -> Result<()> {
+        each!(self, s => s.noop().map_err(into_anyhow))
     }
 }
 
@@ -297,6 +428,134 @@ impl FtpSession {
         self.mlsd
     }
 
+    /// Parallel ranges one FTP download may use (each is its own login):
+    /// the profile's `ftp_segments` (default 1), within the pool's cap.
+    pub fn segments(&self) -> usize {
+        let wanted = self.profile.ftp_segments.unwrap_or(1).clamp(1, 4) as usize;
+        wanted.min(self.pool.cap.load(Ordering::Relaxed)).max(1)
+    }
+
+    /// Wait for a pooled connection or the right to open one. `None` means
+    /// the server allows no extra logins: use the control connection.
+    async fn checkout(&self) -> Option<Slot> {
+        let pool = &self.pool;
+        loop {
+            if let Some(c) = pool.idle.lock().ok().and_then(|mut i| i.pop()) {
+                pool.out.fetch_add(1, Ordering::AcqRel);
+                return Some(Slot::Idle(c));
+            }
+            let cap = pool.cap.load(Ordering::Acquire);
+            let out = pool.out.load(Ordering::Acquire);
+            if out < cap {
+                if pool
+                    .out
+                    .compare_exchange(out, out + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Some(Slot::New);
+                }
+                continue;
+            }
+            // All busy: wait for one to come back (re-check now and then in
+            // case the cap changed).
+            let _ = tokio::time::timeout(Duration::from_secs(1), pool.returned.notified()).await;
+        }
+    }
+
+    /// Run a transfer's data copy on its own logged-in connection (Plan 24
+    /// Phase 8), so browsing never waits behind it. A pooled connection is
+    /// probed with `NOOP` and replaced if it went stale; one that loses its
+    /// connection mid-copy is dropped instead of being returned. If the
+    /// server refuses the extra login, the pool's cap drops and the copy
+    /// falls back to the control connection.
+    pub async fn with_transfer_stream<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut FtpStreamKind) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let Some(slot) = self.checkout().await else {
+            return self.with_stream(f).await;
+        };
+        let guard = SlotGuard(Some(self.pool.clone()));
+        let profile = self.profile.clone();
+        let tls = CertCheck::new(self.pinned_cert.clone());
+        let charset = self.detected_charset.clone();
+        let conn = match slot {
+            Slot::Idle(c) => Some(c),
+            Slot::New => {
+                let (p, t, cs) = (profile.clone(), tls.clone(), charset.clone());
+                match tokio::task::spawn_blocking(move || connect_blocking(&p, &t, &cs))
+                    .await
+                    .map_err(|e| anyhow!("FTP connect task: {e}"))
+                    .and_then(|r| r)
+                {
+                    Ok((c, _)) => Some(c),
+                    Err(e) => {
+                        let pool = &self.pool;
+                        guard.defuse();
+                        pool.out.fetch_sub(1, Ordering::AcqRel);
+                        if refused_login(&e) {
+                            let busy = pool.out.load(Ordering::Acquire).max(1);
+                            pool.cap.store(busy, Ordering::Release);
+                            tracing::warn!(
+                                "FTP {}: server refused another login ({e:#}); \
+                                 using at most {busy} transfer connection(s)",
+                                profile.host
+                            );
+                        }
+                        pool.returned.notify_one();
+                        if pool.out.load(Ordering::Acquire) == 0 {
+                            // Not even one extra login: copy on the control
+                            // connection, as before.
+                            return self.with_stream(f).await;
+                        }
+                        if refused_login(&e) {
+                            // Busy, not broken (some servers say 530 for a
+                            // login limit): retry once a connection frees up.
+                            return Err(into_anyhow(FtpError::ConnectionError(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionRefused,
+                                    format!("server refused another login: {e:#}"),
+                                ),
+                            )));
+                        }
+                        return Err(e.context("FTP transfer connection"));
+                    }
+                }
+            }
+        };
+        let pool = self.pool.clone();
+        // From here the blocking copy returns the slot, even if this future
+        // is dropped.
+        guard.defuse();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn;
+            // A pooled connection may have been closed by the server while
+            // idle: check, and log in afresh if so.
+            if let Some(c) = conn.as_mut() {
+                if c.noop().is_err() {
+                    conn = None;
+                }
+            }
+            let mut c = match conn {
+                Some(c) => c,
+                None => match connect_blocking(&profile, &tls, &charset) {
+                    Ok((c, _)) => c,
+                    Err(e) => {
+                        pool.give_back(None);
+                        return Err(e.context("FTP transfer connection"));
+                    }
+                },
+            };
+            let res = f(&mut c);
+            let healthy = !matches!(&res, Err(e) if is_connection_lost(e));
+            pool.give_back(healthy.then_some(c));
+            res
+        })
+        .await
+        .map_err(|e| anyhow!("FTP task join failed: {e}"))?
+    }
+
     /// Run a closure with mutable access to the underlying FTP stream on a
     /// blocking thread. Use this for any FTP operation — it ensures the
     /// blocking syscalls don't pin a tokio worker.
@@ -412,6 +671,9 @@ pub async fn ftp_connect(
         broken: Arc::new(AtomicBool::new(false)),
         pinned_cert: pinned,
         detected_charset,
+        pool: Arc::new(TransferPool::new(
+            profile.ftp_max_connections.unwrap_or(2).clamp(1, 8) as usize,
+        )),
     })
 }
 

@@ -88,6 +88,15 @@ pub struct ConnectionProfile {
     // Absent = passive, which works through client-side NAT.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ftp_active_mode: Option<bool>,
+    // FTP/FTPS: logged-in connections kept for transfers, separate from the
+    // browsing connection (Plan 24). Absent = 2. Lowered automatically when
+    // the server refuses more logins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ftp_max_connections: Option<u8>,
+    // FTP/FTPS: parallel connections one download may split across. Absent
+    // = 1, since many servers cap logins per user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ftp_segments: Option<u8>,
 }
 
 // Plain JSON file in the app data dir. v0.2 moves secrets into the OS

@@ -183,13 +183,13 @@ async function main() {
     check("paused row shows Paused label", t.includes("Paused"), t.replace(/\n/g, " | "));
     check(
       "paused row offers Resume",
-      await drive((s) => !!window.__vt.btn(s, "Resume (restarts from byte 0)"), SRC.a1)
+      await drive((s) => !!window.__vt.btn(s, "Resume"), SRC.a1)
     );
     check(
       "pause invoked transfer_pause on the mock",
       (await drive((s) => window.__vt.calls("transfer_pause").map((c) => c.args.transferId), SRC.a1)).includes("a1")
     );
-    await drive((s) => window.__vt.click(s, "Resume (restarts from byte 0)"), SRC.a1);
+    await drive((s) => window.__vt.click(s, "Resume"), SRC.a1);
     await sleep(300);
     t = await rowText(SRC.a1);
     check("resumed row is transferring again (0%)", t.includes("0%"), t.replace(/\n/g, " | "));
@@ -301,6 +301,96 @@ async function main() {
       )
     );
     await shot("7-retrying");
+
+    // ---- 8. Plan 24: batched progress drives speed / ETA / stalled / notice ----
+    await drive(() => {
+      const mk = (id, extra = {}) => ({
+        id,
+        kind: "download",
+        source: `/srv/big/${id}.iso`,
+        destination: `C:\\Users\\demo\\Downloads\\${id}.iso`,
+        size: 100 * 1024 * 1024,
+        transferred: 0,
+        status: "transferring",
+        startedAt: Date.now(),
+        ...extra,
+      });
+      window.__demo.seedTransfers([mk("s1"), mk("s2"), mk("s3")], { waiting: [] });
+      return window.__demo.useTransfers.getState().loadInitial();
+    });
+    await sleep(300);
+    // One batch event updates several rows at once.
+    await drive(() => {
+      const base = (id, extra) => ({
+        ...window.__demo.useTransfers.getState().byId[id],
+        ...extra,
+      });
+      window.__demo.emit("transfer://progress-batch", [
+        base("s1", { transferred: 50 * 1024 * 1024, bytesPerSec: 5 * 1024 * 1024, etaSecs: 10, segments: 4 }),
+        base("s2", { transferred: 10 * 1024 * 1024, bytesPerSec: 1024 * 1024, etaSecs: 90 }),
+        base("s3", { transferred: 1024 * 1024, stalled: true, notice: "remote changed, restarted" }),
+      ]);
+    });
+    await sleep(300);
+    t = await rowText("/srv/big/s1.iso");
+    check("batched row shows its speed", t.includes("5.0 MB/s"), t.replace(/\n/g, " | "));
+    check("batched row shows its ETA", t.includes("10s"), t.replace(/\n/g, " | "));
+    check("batched row shows 50%", t.includes("50%"), t.replace(/\n/g, " | "));
+    check(
+      "segment count is in the speed tooltip",
+      await drive(() =>
+        !!window.__vt.row("/srv/big/s1.iso")?.querySelector('[title="4 parallel connections"]')
+      )
+    );
+    t = await rowText("/srv/big/s2.iso");
+    check(
+      "second row from the same batch updated",
+      t.includes("1.0 MB/s") && t.includes("1m 30s"),
+      t.replace(/\n/g, " | ")
+    );
+    t = await rowText("/srv/big/s3.iso");
+    check("stalled row reads 'not responding'", t.includes("not responding"), t.replace(/\n/g, " | "));
+    check("notice line renders", t.includes("remote changed, restarted"), t.replace(/\n/g, " | "));
+    const hdr8 = await drive(() => document.body.innerText);
+    check(
+      "header shows the combined speed",
+      hdr8.includes("6.0 MB/s"),
+      hdr8.match(/[\d.]+ MB\/s/g)?.join(",") ?? "none"
+    );
+    await shot("8-speed-eta");
+
+    // ---- 9. Plan 24: a row restored from the last session ----
+    await drive(() => {
+      window.__demo.seedTransfers(
+        [
+          {
+            id: "old1",
+            kind: "download",
+            source: "/srv/big/old.iso",
+            destination: "C:\\Users\\demo\\Downloads\\old.iso",
+            size: 1000,
+            transferred: 400,
+            status: "paused",
+            restored: true,
+            startedAt: Date.now(),
+          },
+        ],
+        { waiting: [] }
+      );
+      return window.__demo.useTransfers.getState().loadInitial();
+    });
+    await sleep(300);
+    t = await rowText("/srv/big/old.iso");
+    check("restored row shows Paused at its progress", t.includes("Paused") && t.includes("400 B"), t.replace(/\n/g, " | "));
+    check("restored row explains it needs its connection", t.includes("Open its connection, then resume"), t.replace(/\n/g, " | "));
+    check("restored row offers Resume", await drive(() => !!window.__vt.btn("/srv/big/old.iso", "Resume")));
+    await drive(() => window.__vt.click("/srv/big/old.iso", "Resume"));
+    await sleep(300);
+    check(
+      "Resume on a restored row invokes transfer_resume",
+      (await drive(() => window.__vt.calls("transfer_resume").map((c) => c.args.transferId))).includes("old1")
+    );
+    await shot("9-restored");
 
     if (failures === 0) console.log("\n✅ all transfer-queue checks passed");
     else console.log(`\n❌ ${failures} check(s) failed`);

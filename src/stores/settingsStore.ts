@@ -101,6 +101,12 @@ interface SettingsState {
   /** Delta sync: send only changed blocks on re-transfers (Faro Agent
    *  connections, files ≥ 8 MB). Live-applied; `FARO_DELTA=0` overrides. */
   deltaSync: boolean;
+  /** Max parallel ranges/parts per file (Plan 24). "auto" ramps up within
+   *  each backend's ceiling; 1 turns segmentation off. Live-applied. */
+  transferSegments: "auto" | number;
+  /** Verify finished transfers with a checksum where the backend offers one
+   *  (Plan 24). Live-applied. */
+  transferVerify: boolean;
   /** Where downloads land. Blank = the OS Downloads folder. */
   defaultDownloadFolder: string;
   /** Command/path used to open files for edit-in-place. Blank = OS default app. */
@@ -149,6 +155,8 @@ interface SettingsState {
   setTransferConcurrency: (n: number) => void;
   setTransferThrottleKbps: (n: number) => void;
   setDeltaSync: (v: boolean) => void;
+  setTransferSegments: (v: "auto" | number) => void;
+  setTransferVerify: (v: boolean) => void;
   setDefaultDownloadFolder: (s: string) => void;
   setDefaultEditor: (s: string) => void;
   setShowHiddenFiles: (v: boolean) => void;
@@ -183,6 +191,8 @@ type Persisted = Omit<
   | "setTransferConcurrency"
   | "setTransferThrottleKbps"
   | "setDeltaSync"
+  | "setTransferSegments"
+  | "setTransferVerify"
   | "setDefaultDownloadFolder"
   | "setDefaultEditor"
   | "setShowHiddenFiles"
@@ -214,6 +224,8 @@ const DEFAULTS: Persisted = {
   transferConcurrency: 3,
   transferThrottleKbps: 0,
   deltaSync: true,
+  transferSegments: "auto",
+  transferVerify: false,
   defaultDownloadFolder: "",
   defaultEditor: "",
   // On by default: Faro's work is server admin, where the interesting files are
@@ -318,6 +330,14 @@ export const useSettings = create<SettingsState>((set, get) => ({
     mutate(set, get, "deltaSync", v);
     // Live-apply to the transfer engine; the persisted value covers next launch.
     ipc.transferSetDeltaSync(v).catch(() => {});
+  },
+  setTransferSegments: (v) => {
+    mutate(set, get, "transferSegments", v);
+    ipc.transferSetSegments(v === "auto" ? 0 : v).catch(() => {});
+  },
+  setTransferVerify: (v) => {
+    mutate(set, get, "transferVerify", v);
+    ipc.transferSetVerify(v).catch(() => {});
   },
   setDefaultDownloadFolder: (s) =>
     mutate(set, get, "defaultDownloadFolder", s),

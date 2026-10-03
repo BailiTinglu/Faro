@@ -285,6 +285,8 @@ pub async fn dropbox_authorize(profile_id: String) -> Result<DropboxAuthResult, 
         jump_username: None,
         ftp_encoding: None,
         ftp_active_mode: None,
+        ftp_max_connections: None,
+        ftp_segments: None,
     };
     let account_label = match crate::session::dropbox_connect(&probe).await {
         Ok(session) => session.account_label().await.unwrap_or_default(),
@@ -330,6 +332,8 @@ pub async fn onedrive_authorize(profile_id: String) -> Result<DropboxAuthResult,
         jump_username: None,
         ftp_encoding: None,
         ftp_active_mode: None,
+        ftp_max_connections: None,
+        ftp_segments: None,
     };
     let account_label = match crate::session::onedrive_connect(&probe).await {
         Ok(session) => session.account_label().await.unwrap_or_default(),
@@ -386,6 +390,8 @@ pub async fn dynamics_authorize(
         jump_username: None,
         ftp_encoding: None,
         ftp_active_mode: None,
+        ftp_max_connections: None,
+        ftp_segments: None,
     };
     let account_label = match crate::session::dynamics_connect(&probe).await {
         Ok(session) => session.account_label().await.unwrap_or_default(),
@@ -426,6 +432,8 @@ pub async fn gdrive_authorize(profile_id: String) -> Result<DropboxAuthResult, S
         jump_username: None,
         ftp_encoding: None,
         ftp_active_mode: None,
+        ftp_max_connections: None,
+        ftp_segments: None,
     };
     let account_label = match crate::session::gdrive_connect(&probe).await {
         Ok(session) => session.account_label().await.unwrap_or_default(),
@@ -466,6 +474,8 @@ pub async fn box_authorize(profile_id: String) -> Result<DropboxAuthResult, Stri
         jump_username: None,
         ftp_encoding: None,
         ftp_active_mode: None,
+        ftp_max_connections: None,
+        ftp_segments: None,
     };
     let account_label = match crate::session::box_connect(&probe).await {
         Ok(session) => session.account_label().await.unwrap_or_default(),
@@ -779,6 +789,26 @@ pub async fn transfer_resume(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // A row restored from an earlier run (Plan 24) resumes on its connection,
+    // which the user has to have open.
+    if let Some(profile_id) = state.transfers.restored_connection(&transfer_id).await {
+        let Some(session) = state.sessions.find_by_profile(&profile_id).await else {
+            let name = state
+                .profiles
+                .get(&profile_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.name)
+                .unwrap_or_else(|| "its connection".into());
+            return Err(format!("Connect to {name} first, then resume this transfer."));
+        };
+        return state
+            .transfers
+            .resume_restored(&transfer_id, session, &app)
+            .await
+            .map_err(err);
+    }
     state
         .transfers
         .resume(&transfer_id, &app)
@@ -861,6 +891,29 @@ pub async fn transfer_set_delta_sync(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     state.transfers.set_delta_enabled(enabled);
+    Ok(())
+}
+
+/// Live-adjust how many parallel ranges/parts one file may use (Plan 24);
+/// 0 = auto.
+#[tauri::command]
+pub async fn transfer_set_segments(
+    count: u32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .transfers
+        .set_segments((count > 0).then_some(count as usize));
+    Ok(())
+}
+
+/// Live-adjust checksum verification of finished transfers (Plan 24).
+#[tauri::command]
+pub async fn transfer_set_verify(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.transfers.set_verify(enabled);
     Ok(())
 }
 

@@ -93,6 +93,8 @@ impl ProfilePreview {
             jump_username: None,
             ftp_encoding: self.ftp_encoding,
             ftp_active_mode: self.ftp_active_mode,
+            ftp_max_connections: None,
+            ftp_segments: None,
         }
     }
 }
