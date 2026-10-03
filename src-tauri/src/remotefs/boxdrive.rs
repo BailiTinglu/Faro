@@ -241,6 +241,8 @@ mod tests {
             jump_host: None,
             jump_port: None,
             jump_username: None,
+            ftp_encoding: None,
+            ftp_active_mode: None,
         };
         let session = Arc::new(box_connect(&profile).await.expect("connect"));
 

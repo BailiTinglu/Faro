@@ -188,6 +188,9 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
     seed?.defaultRemotePath ?? "."
   );
   const [autoConnect, setAutoConnect] = useState(profile?.autoConnect ?? false);
+  // FTP-only: path-name character set ("" = auto).
+  const [ftpEncoding, setFtpEncoding] = useState(seed?.ftpEncoding ?? "");
+  const [ftpActiveMode, setFtpActiveMode] = useState(seed?.ftpActiveMode ?? false);
   const [group, setGroup] = useState(seed?.group ?? "");
   // Custom rail bubble glyph: emoji/short string, or a bundled Iconify key
   // (picked via the IconPicker grid; custom keys still possible via search).
@@ -455,6 +458,8 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
       jumpHost: profile?.jumpHost,
       jumpPort: profile?.jumpPort,
       jumpUsername: profile?.jumpUsername,
+      ftpEncoding: isFtp ? ftpEncoding || undefined : undefined,
+      ftpActiveMode: isFtp && ftpActiveMode ? true : undefined,
     };
   };
 
@@ -917,6 +922,40 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
             className={inputCls}
           />
         </Field>
+
+        {isFtp && (
+          <div className="flex gap-3">
+            <Field label="Character set" className="min-w-0 flex-1">
+              <select
+                value={ftpEncoding}
+                onChange={(e) => setFtpEncoding(e.target.value)}
+                className={inputCls}
+              >
+                {FTP_CHARSETS.map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+                {/* An imported/hand-edited label we don't list: keep it. */}
+                {ftpEncoding &&
+                  !FTP_CHARSETS.some(([v]) => v === ftpEncoding) && (
+                    <option value={ftpEncoding}>{ftpEncoding}</option>
+                  )}
+              </select>
+            </Field>
+            <Field label="Transfer mode" className="w-40 shrink-0">
+              <select
+                value={ftpActiveMode ? "active" : "passive"}
+                onChange={(e) => setFtpActiveMode(e.target.value === "active")}
+                className={inputCls}
+                title="Passive works through home routers and most firewalls. Use active only when the server's passive ports are blocked."
+              >
+                <option value="passive">Passive</option>
+                <option value="active">Active</option>
+              </select>
+            </Field>
+          </div>
+        )}
 
         <label className="mb-3 flex cursor-pointer items-center gap-2.5 rounded-md border border-border bg-bg-subtle px-2.5 py-2">
           <input
@@ -2464,6 +2503,33 @@ function Hint({
     </div>
   );
 }
+
+/** FTP path-name charsets offered in the editor: [WHATWG label, display].
+ *  "" is auto — UTF-8, falling back to Windows-1252 if the server sends
+ *  names that aren't valid UTF-8. */
+const FTP_CHARSETS: [string, string][] = [
+  ["", "Auto (UTF-8, falls back to Western)"],
+  ["utf-8", "UTF-8"],
+  ["windows-1252", "Western European (Windows-1252 / Latin-1)"],
+  ["iso-8859-15", "Western European (ISO-8859-15)"],
+  ["windows-1250", "Central European (Windows-1250)"],
+  ["iso-8859-2", "Central European (ISO-8859-2)"],
+  ["windows-1251", "Cyrillic (Windows-1251)"],
+  ["koi8-r", "Cyrillic (KOI8-R)"],
+  ["windows-1253", "Greek (Windows-1253)"],
+  ["windows-1254", "Turkish (Windows-1254)"],
+  ["windows-1255", "Hebrew (Windows-1255)"],
+  ["windows-1256", "Arabic (Windows-1256)"],
+  ["windows-1257", "Baltic (Windows-1257)"],
+  ["windows-1258", "Vietnamese (Windows-1258)"],
+  ["windows-874", "Thai (Windows-874)"],
+  ["shift_jis", "Japanese (Shift_JIS)"],
+  ["euc-jp", "Japanese (EUC-JP)"],
+  ["gbk", "Chinese Simplified (GBK)"],
+  ["gb18030", "Chinese Simplified (GB18030)"],
+  ["big5", "Chinese Traditional (Big5)"],
+  ["euc-kr", "Korean (EUC-KR)"],
+];
 
 const inputCls =
   "w-full rounded-md border border-border bg-bg-subtle px-2.5 py-1.5 text-sm outline-none focus:border-accent";

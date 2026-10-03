@@ -75,8 +75,18 @@ faro-agent-proto = { path = "faro-agent-proto" }
 faro-agentd = { path = "faro-agentd" }
 mdns-sd = "0.11"
 
+# Vela companion app: transfers, Agent Bridge requests and folder sync on the
+# Vela desk and phones.
+vela-companion = { git = "https://github.com/jhd3197/vela-companion" }
+
 # FTP / FTPS — sync API, driven from tokio via spawn_blocking.
-suppaftp = { version = "6", features = ["native-tls"] }
+# rustls is the default FTPS stack (TLS session reuse across the control and
+# data connections); native-tls stays as the fallback for TLS 1.0/1.1 servers.
+suppaftp = { version = "6", features = ["native-tls", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-platform-verifier = "0.7"
+# FTP charset support (non-UTF-8 servers): see session/ftp.rs.
+encoding_rs = "0.8"
 
 # S3 / R2 / B2 — Apache Arrow's polymorphic object_store crate. The same crate
 # backs Azure Blob (`azure` feature) and native Google Cloud Storage (`gcp`).
@@ -189,3 +199,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# suppaftp 6.3.0 plus a small patch (a pluggable charset for commands and
+# listings) so FTP servers that don't speak UTF-8 work — upstream has no hook
+# for it. See vendor/suppaftp/FARO_PATCH.md.
+[patch.crates-io]
+suppaftp = { path = "vendor/suppaftp" }

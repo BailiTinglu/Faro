@@ -58,6 +58,106 @@ impl std::fmt::Display for RestartFromPause {
 
 impl std::error::Error for RestartFromPause {}
 
+/// Bytes between FTP checkpoint round-trips (throttle, pause, progress).
+const FTP_CHUNK: u64 = 256 * 1024;
+
+/// Message from a blocking FTP copy to `TransferManager::ftp_pump`.
+enum FtpProgress {
+    /// The destination is open and the copy starts at this offset.
+    Start(u64),
+    /// This many more bytes moved.
+    Chunk(u64),
+}
+
+/// Blocking side of the FTP copy <-> transfer manager handshake: report,
+/// then wait for the go-ahead. A refusal (pause, cancel) or a vanished pump
+/// aborts the copy with an I/O error.
+struct FtpGate {
+    tx: tokio::sync::mpsc::Sender<FtpProgress>,
+    ack: std::sync::mpsc::Receiver<bool>,
+}
+
+impl FtpGate {
+    fn new() -> (
+        Self,
+        tokio::sync::mpsc::Receiver<FtpProgress>,
+        std::sync::mpsc::SyncSender<bool>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, ack) = std::sync::mpsc::sync_channel(1);
+        (Self { tx, ack }, rx, ack_tx)
+    }
+
+    fn send(&self, msg: FtpProgress) -> std::io::Result<()> {
+        let interrupted = || std::io::Error::new(std::io::ErrorKind::Interrupted, "transfer interrupted");
+        self.tx.blocking_send(msg).map_err(|_| interrupted())?;
+        match self.ack.recv() {
+            Ok(true) => Ok(()),
+            _ => Err(interrupted()),
+        }
+    }
+
+    fn start(&self, offset: u64) -> std::io::Result<()> {
+        self.send(FtpProgress::Start(offset))
+    }
+}
+
+/// Download sink: write through, reporting every `FTP_CHUNK` to the gate.
+struct GatedWriter<W: std::io::Write> {
+    inner: W,
+    gate: FtpGate,
+    pending: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for GatedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.pending += n as u64;
+        if self.pending >= FTP_CHUNK {
+            self.gate.send(FtpProgress::Chunk(std::mem::take(&mut self.pending)))?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: std::io::Write> GatedWriter<W> {
+    /// Flush the file and report the final partial chunk.
+    fn finish(mut self) -> std::io::Result<()> {
+        self.inner.flush()?;
+        let rest = std::mem::take(&mut self.pending);
+        self.gate.send(FtpProgress::Chunk(rest))
+    }
+}
+
+/// Upload source: read through, reporting every `FTP_CHUNK` to the gate.
+struct GatedReader<R: std::io::Read> {
+    inner: R,
+    gate: FtpGate,
+    pending: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for GatedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pending >= FTP_CHUNK {
+            self.gate.send(FtpProgress::Chunk(std::mem::take(&mut self.pending)))?;
+        }
+        let n = self.inner.read(buf)?;
+        self.pending += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: std::io::Read> GatedReader<R> {
+    fn finish(mut self) -> std::io::Result<()> {
+        let rest = std::mem::take(&mut self.pending);
+        self.gate.send(FtpProgress::Chunk(rest))
+    }
+}
+
 /// Payload of the `transfer://queue` event: the FIFO of waiting transfer ids
 /// plus the manager-level state the panel header renders (Plan 17).
 #[derive(Debug, Clone, Serialize)]
@@ -189,6 +289,11 @@ pub struct Transfer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<DeltaStats>,
     pub started_at: i64,
+    /// An earlier attempt of this transfer created (or truncated) the
+    /// destination and started writing it, so a partial file there is ours
+    /// to resume rather than someone else's file to overwrite. FTP only.
+    #[serde(skip)]
+    pub resumable: bool,
 }
 
 /// Delta-sync outcome attached to a finished [`Transfer`] (Agent backend only).
@@ -736,6 +841,7 @@ impl TransferManager {
             retry_attempt: None,
             delta: None,
             started_at: now_ts(),
+            resumable: false,
         };
         self.insert(transfer.clone()).await;
         let _ = app.emit("transfer://added", &transfer);
@@ -916,6 +1022,7 @@ impl TransferManager {
             retry_attempt: None,
             delta: None,
             started_at: now_ts(),
+            resumable: false,
         };
         self.insert(transfer.clone()).await;
         let _ = app.emit("transfer://added", &transfer);
@@ -1640,76 +1747,160 @@ impl TransferManager {
         Ok(ids)
     }
 
+    /// FTP download. suppaftp is blocking, so the copy runs on a blocking
+    /// thread and reports every `FTP_CHUNK` through `ftp_pump`, which applies
+    /// the same throttle/pause checkpoint and progress events as the other
+    /// backends. A retry of a transfer that already started resumes from the
+    /// partial file with `REST` instead of starting over.
     async fn run_ftp_download(
         &self,
         id: &str,
         session: Arc<FtpSession>,
         remote_path: &str,
         local_path: &Path,
-        app: &AppHandle,
+        app: Option<&AppHandle>,
     ) -> Result<()> {
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
-
-        // FTP's data channel doesn't surface incremental progress easily without
-        // an extra control round-trip. We can still report mid-transfer by
-        // calling .size() up front, then bumping `transferred` to size on
-        // completion. For now we keep it simple: 0 -> size on done.
-        let final_path = local_path.to_path_buf();
-        let path = remote_path.to_string();
-        let id_for_emit = id.to_string();
-        let app_for_emit = app.clone();
-        let mgr_for_emit: *const TransferManager = self;
-        // The pointer cast keeps the closure 'static — we re-form an Arc via
-        // the field on the manager's containing Arc inside the blocking task.
-        // Since the blocking task is awaited (not detached), the manager
-        // outlives the borrow. We update progress after the task returns.
-
-        let _ = (mgr_for_emit, id_for_emit, app_for_emit);
-
         self.checkpoint(id, 0).await?;
-        let res: Result<u64> = session
-            .with_stream(move |stream| {
-                let file = std::fs::File::create(&final_path)
-                    .with_context(|| format!("create {}", final_path.display()))?;
-                let written = stream
-                    .retr_to_writer(&path, std::io::BufWriter::new(file))?;
-                Ok(written)
-            })
-            .await;
 
-        let written = res?;
-        self.update(id, |t| t.transferred = written).await;
-        Ok(())
+        let resumable = self.get(id).await.is_some_and(|t| t.resumable);
+        let offset = if resumable {
+            std::fs::metadata(local_path).map(|m| m.len()).unwrap_or(0)
+        } else {
+            0
+        };
+
+        let (gate, rx, ack) = FtpGate::new();
+        let path = local_path.to_path_buf();
+        let remote = remote_path.to_string();
+        let copy = session.with_stream(move |stream| {
+            // Fall back to a full download if the server refuses REST.
+            let start = if offset > 0 && stream.restart_at(offset).is_ok() {
+                offset
+            } else {
+                0
+            };
+            let file = if start > 0 {
+                std::fs::OpenOptions::new().append(true).open(&path)
+            } else {
+                std::fs::File::create(&path)
+            }
+            .with_context(|| format!("open {}", path.display()))?;
+            gate.start(start)?;
+            let mut sink = GatedWriter {
+                inner: std::io::BufWriter::new(file),
+                gate,
+                pending: 0,
+            };
+            stream.retr_to_writer(&remote, &mut sink)?;
+            sink.finish()?;
+            Ok(())
+        });
+        let (res, stop) = tokio::join!(copy, self.ftp_pump(id, app, rx, ack));
+        // A pause/cancel at a checkpoint is the real reason the copy failed.
+        if let Some(e) = stop {
+            return Err(e);
+        }
+        res
     }
 
+    /// FTP upload: like the download, with `APPE` from the remote file's
+    /// current size when resuming an upload that already started.
     async fn run_ftp_upload(
         &self,
         id: &str,
         session: Arc<FtpSession>,
         local_path: &Path,
         remote_path: &str,
-        app: &AppHandle,
+        app: Option<&AppHandle>,
     ) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
-        let _ = app; // progress events come at completion for FTP
-
         self.checkpoint(id, 0).await?;
+
+        let resumable = self.get(id).await.is_some_and(|t| t.resumable);
+        let (gate, rx, ack) = FtpGate::new();
         let local = local_path.to_path_buf();
         let remote = remote_path.to_string();
-        let res: Result<u64> = session
-            .with_stream(move |stream| {
-                let file = std::fs::File::open(&local)
-                    .with_context(|| format!("open {}", local.display()))?;
-                let mut reader = std::io::BufReader::new(file);
-                let written = stream.put_from_reader(&remote, &mut reader)?;
-                Ok(written)
-            })
-            .await;
-        let written = res?;
-        self.update(id, |t| t.transferred = written).await;
-        Ok(())
+        let copy = session.with_stream(move |stream| {
+            let mut file = std::fs::File::open(&local)
+                .with_context(|| format!("open {}", local.display()))?;
+            let local_len = file.metadata()?.len();
+            // Resume only when the remote partial is a plausible prefix.
+            let start = if resumable {
+                match stream.size(&remote) {
+                    Ok(n) if n > 0 && (n as u64) <= local_len => n as u64,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            file.seek(SeekFrom::Start(start))?;
+            let mut reader = GatedReader {
+                inner: std::io::BufReader::new(file),
+                gate,
+                pending: 0,
+            };
+            // Mark the transfer resumable only once STOR/APPE is accepted: if
+            // the server refuses it, whatever already sits at `remote` is not
+            // ours and a retry must not append to it.
+            stream.upload(&remote, start > 0, &mut reader, |r| r.gate.start(start))?;
+            reader.finish()?;
+            Ok(())
+        });
+        let (res, stop) = tokio::join!(copy, self.ftp_pump(id, app, rx, ack));
+        if let Some(e) = stop {
+            return Err(e);
+        }
+        res
+    }
+
+    /// Async half of an FTP copy: for each chunk the blocking side reports,
+    /// run the throttle/pause checkpoint, publish progress, then let the copy
+    /// continue (or tell it to stop). Returns the checkpoint error that
+    /// stopped the copy, if any (`RestartFromPause`).
+    async fn ftp_pump(
+        &self,
+        id: &str,
+        app: Option<&AppHandle>,
+        mut rx: tokio::sync::mpsc::Receiver<FtpProgress>,
+        ack: std::sync::mpsc::SyncSender<bool>,
+    ) -> Option<anyhow::Error> {
+        let mut done = 0u64;
+        let mut last_emit = Instant::now();
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                FtpProgress::Start(offset) => {
+                    // From here on the destination is this transfer's partial.
+                    done = offset;
+                    self.update(id, |t| {
+                        t.transferred = offset;
+                        t.resumable = true;
+                    })
+                    .await;
+                    let _ = ack.send(true);
+                }
+                FtpProgress::Chunk(n) => {
+                    if let Err(e) = self.checkpoint(id, n).await {
+                        let _ = ack.send(false);
+                        return Some(e);
+                    }
+                    done += n;
+                    if last_emit.elapsed() > Duration::from_millis(100) {
+                        self.update(id, |t| t.transferred = done).await;
+                        if let (Some(app), Some(t)) = (app, self.get(id).await) {
+                            let _ = app.emit("transfer://progress", &t);
+                        }
+                        last_emit = Instant::now();
+                    }
+                    let _ = ack.send(true);
+                }
+            }
+        }
+        self.update(id, |t| t.transferred = done).await;
+        None
     }
 
     async fn run_object_download(
@@ -3188,7 +3379,7 @@ async fn dispatch_download(
                 .await
         }
         Session::Ftp(ftp) => {
-            mgr.run_ftp_download(id, ftp.clone(), remote_path, final_path, app)
+            mgr.run_ftp_download(id, ftp.clone(), remote_path, final_path, Some(app))
                 .await
         }
         Session::Object(obj) => {
@@ -3254,7 +3445,7 @@ async fn dispatch_upload(
                 .await
         }
         Session::Ftp(ftp) => {
-            mgr.run_ftp_upload(id, ftp.clone(), local, final_remote, app)
+            mgr.run_ftp_upload(id, ftp.clone(), local, final_remote, Some(app))
                 .await
         }
         Session::Object(obj) => {
@@ -3602,6 +3793,7 @@ mod tests {
             retry_attempt: None,
             delta: None,
             started_at: 0,
+            resumable: false,
         })
         .await;
         mgr
@@ -3645,6 +3837,8 @@ mod tests {
             jump_host: None,
             jump_port: None,
             jump_username: None,
+            ftp_encoding: None,
+            ftp_active_mode: None,
         }
     }
 
