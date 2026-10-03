@@ -28,11 +28,17 @@ pub struct ObjectSession {
 /// and restarts from byte 0. Transfers get no whole-request timeout instead,
 /// and the transfer engine's stall watchdog aborts a connection that stops
 /// moving bytes. Connecting keeps a short timeout so a dead endpoint fails
-/// fast. object_store's own `RetryConfig` stays at its defaults.
-fn client_options() -> ClientOptions {
+/// fast. object_store's own `RetryConfig` stays at its defaults. A custom
+/// `http://` endpoint (a LAN MinIO, the Azurite emulator) is allowed.
+fn client_options(profile: &ConnectionProfile) -> ClientOptions {
+    let plain_http = profile
+        .endpoint
+        .as_deref()
+        .is_some_and(|e| e.trim().to_ascii_lowercase().starts_with("http://"));
     ClientOptions::new()
         .with_connect_timeout(Duration::from_secs(10))
         .with_timeout_disabled()
+        .with_allow_http(plain_http)
 }
 
 pub async fn object_connect(profile: &ConnectionProfile) -> Result<ObjectSession> {
@@ -70,7 +76,7 @@ async fn s3_connect(profile: &ConnectionProfile) -> Result<ObjectSession> {
         .with_access_key_id(&access_key)
         .with_secret_access_key(&secret_key)
         .with_region(&region)
-        .with_client_options(client_options());
+        .with_client_options(client_options(profile));
 
     if let Some(endpoint) = profile.endpoint.as_ref().filter(|s| !s.is_empty()) {
         builder = builder.with_endpoint(endpoint);
@@ -124,7 +130,7 @@ async fn azure_connect(profile: &ConnectionProfile) -> Result<ObjectSession> {
         .with_account(&account)
         .with_container_name(&container)
         .with_access_key(&access_key)
-        .with_client_options(client_options());
+        .with_client_options(client_options(profile));
 
     if let Some(endpoint) = profile.endpoint.as_ref().filter(|s| !s.is_empty()) {
         builder = builder.with_endpoint(endpoint.clone());
@@ -156,7 +162,7 @@ async fn gcs_connect(profile: &ConnectionProfile) -> Result<ObjectSession> {
 
     let mut builder = GoogleCloudStorageBuilder::new()
         .with_bucket_name(&bucket)
-        .with_client_options(client_options());
+        .with_client_options(client_options(profile));
 
     match &profile.auth {
         AuthMethod::Key { path, .. } => {

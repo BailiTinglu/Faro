@@ -135,6 +135,9 @@ pub async fn walk<F: FnMut(ScanProgress)>(
             for entry in entries {
                 match entry.kind {
                     FileKind::Directory => queue.push_back(entry.path.clone()),
+                    // An in-progress download's temp (Plan 24) is not a file
+                    // the user has yet: never sync, diff or index it.
+                    FileKind::File if crate::transfer::is_part_file(&entry.name) => {}
                     FileKind::File => {
                         bytes_found += entry.size;
                         let rel = relative_of(&normalized_root, &entry.path);

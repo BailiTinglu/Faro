@@ -226,6 +226,11 @@ function Row({
         {t.notice && (
           <div className="mt-0.5 text-[11px] text-warning">{t.notice}</div>
         )}
+        {t.restored && (
+          <div className="mt-0.5 text-[11px] text-text-dim">
+            Unfinished from your last session. Open its connection, then resume.
+          </div>
+        )}
         {t.status === "transferring" && (
           <div className="mt-1 h-1 w-full overflow-hidden rounded bg-bg-subtle">
             <div
@@ -295,7 +300,7 @@ function Row({
         <button
           onClick={onResume}
           className="rounded p-1 text-text-muted hover:bg-bg-hover hover:text-text"
-          title="Resume (restarts from byte 0)"
+          title="Resume"
         >
           <Play size={12} />
         </button>

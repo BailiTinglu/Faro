@@ -1129,6 +1129,9 @@ export interface Transfer {
   stalled?: boolean;
   /** One-line note about the run, e.g. "remote changed, restarted". */
   notice?: string;
+  /** Unfinished transfer restored from the last session (Plan 24): Paused,
+   *  resumable once its connection is open. */
+  restored?: boolean;
 }
 
 /** Live transfer-queue snapshot (Plan 17) — payload of `transfer://queue` and

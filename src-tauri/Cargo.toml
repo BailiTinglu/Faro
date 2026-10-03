@@ -165,6 +165,10 @@ winreg = "0.52"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # Transfer temp files (Plan 24): free-space check + sparse preallocation.
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
 ] }
 # cloud-filter drives the hard part (connect + placeholders + hydration
 # callbacks over cldapi). The `windows` crate (same 0.58 cloud-filter pulls) is
@@ -176,6 +180,10 @@ windows = { version = "0.58", optional = true, features = [
     "Win32_Foundation",
     "Win32_Storage_CloudFilters",
 ] }
+
+# Free-space check before preallocating a download's temp file (Plan 24).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # Paused-clock tokio tests for the transfer token bucket (Plan 17).

@@ -111,7 +111,60 @@ const MIGRATIONS: &[&str] = &[
         vtype        INTEGER NOT NULL,
         backed_up_ms INTEGER NOT NULL
     ) WITHOUT ROWID;",
+    // v7 — transfer resume records (Plan 24 Phase 4). One row per unfinished
+    // transfer, so it can continue after a pause, a retry or an app restart.
+    // `ranges_done` is a JSON list of `[start, end)` byte ranges already on
+    // disk (downloads) or acknowledged by the server (uploads, `[[0, n]]`).
+    // It is written only after the data it describes was synced, so it never
+    // claims bytes that aren't there. `remote_*` pin which remote file a
+    // download is fetching and `local_*` which local file an upload is
+    // sending; a mismatch restarts from 0. `multipart_upload_id` /
+    // `parts_done` are reserved for object-store multipart resume across
+    // restarts (object_store 0.11 can't list an upload's parts).
+    "CREATE TABLE transfer_resume (
+        id                  TEXT    PRIMARY KEY,
+        connection_id       TEXT    NOT NULL,
+        kind                TEXT    NOT NULL,
+        source              TEXT    NOT NULL,
+        destination         TEXT    NOT NULL,
+        part_path           TEXT,
+        size                INTEGER NOT NULL,
+        policy              TEXT    NOT NULL DEFAULT 'overwrite',
+        remote_size         INTEGER,
+        remote_etag         TEXT,
+        remote_mtime        INTEGER,
+        local_size          INTEGER,
+        local_mtime         INTEGER,
+        ranges_done         TEXT    NOT NULL DEFAULT '[]',
+        multipart_upload_id TEXT,
+        parts_done          TEXT,
+        updated_at          INTEGER NOT NULL
+    );",
 ];
+
+/// A saved unfinished transfer (Plan 24 Phase 4), as stored in
+/// `transfer_resume`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumeRow {
+    pub id: String,
+    pub connection_id: String,
+    /// "download" | "upload".
+    pub kind: String,
+    pub source: String,
+    pub destination: String,
+    pub part_path: Option<String>,
+    pub size: u64,
+    /// "overwrite" | "skip" | "rename".
+    pub policy: String,
+    pub remote_size: Option<u64>,
+    pub remote_etag: Option<String>,
+    pub remote_mtime: Option<i64>,
+    pub local_size: Option<u64>,
+    pub local_mtime: Option<i64>,
+    /// JSON `[[start, end], …]`.
+    pub ranges_done: String,
+    pub updated_at: i64,
+}
 
 /// A persisted per-file sync record — what the source looked like the last time
 /// this pair synced it. The reconciler diffs the *current* source against this to
@@ -438,6 +491,94 @@ impl Db {
         Ok(())
     }
 
+    // ---- Transfer resume records (Plan 24 Phase 4) ----
+
+    /// Insert or replace a transfer's resume record.
+    pub fn resume_upsert(&self, r: &ResumeRow) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO transfer_resume (id, connection_id, kind, source, destination,
+                part_path, size, policy, remote_size, remote_etag, remote_mtime,
+                local_size, local_mtime, ranges_done, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(id) DO UPDATE SET connection_id = excluded.connection_id,
+                kind = excluded.kind, source = excluded.source,
+                destination = excluded.destination, part_path = excluded.part_path,
+                size = excluded.size, policy = excluded.policy,
+                remote_size = excluded.remote_size, remote_etag = excluded.remote_etag,
+                remote_mtime = excluded.remote_mtime, local_size = excluded.local_size,
+                local_mtime = excluded.local_mtime, ranges_done = excluded.ranges_done,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                r.id,
+                r.connection_id,
+                r.kind,
+                r.source,
+                r.destination,
+                r.part_path,
+                r.size as i64,
+                r.policy,
+                r.remote_size.map(|v| v as i64),
+                r.remote_etag,
+                r.remote_mtime,
+                r.local_size.map(|v| v as i64),
+                r.local_mtime,
+                r.ranges_done,
+                r.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record new progress for an existing resume record.
+    pub fn resume_set_ranges(&self, id: &str, ranges_done: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE transfer_resume SET ranges_done = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, ranges_done, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn resume_delete(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM transfer_resume WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Every saved unfinished transfer, oldest first.
+    pub fn resume_list(&self) -> Result<Vec<ResumeRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, connection_id, kind, source, destination, part_path, size, policy,
+                    remote_size, remote_etag, remote_mtime, local_size, local_mtime,
+                    ranges_done, updated_at
+             FROM transfer_resume ORDER BY updated_at",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ResumeRow {
+                    id: r.get(0)?,
+                    connection_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    source: r.get(3)?,
+                    destination: r.get(4)?,
+                    part_path: r.get(5)?,
+                    size: r.get::<_, i64>(6)? as u64,
+                    policy: r.get(7)?,
+                    remote_size: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                    remote_etag: r.get(9)?,
+                    remote_mtime: r.get(10)?,
+                    local_size: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+                    local_mtime: r.get(12)?,
+                    ranges_done: r.get(13)?,
+                    updated_at: r.get(14)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // ---- Remote thumbnail cache index (Plan 13 Phase 1) ----
 
     /// True if a live cache row exists for `key`, bumping its `used_ms` so the LRU
@@ -753,6 +894,38 @@ mod tests {
         let (val, vtype) = db.env_backup_get("other_key").unwrap().unwrap();
         assert_eq!(val, None);
         assert_eq!(vtype, 1);
+    }
+
+    #[test]
+    fn transfer_resume_round_trips() {
+        let db = Db::open_in_memory().unwrap();
+        let mut row = ResumeRow {
+            id: "t1".into(),
+            connection_id: "prof".into(),
+            kind: "download".into(),
+            source: "/srv/a.bin".into(),
+            destination: "C:/dl/a.bin".into(),
+            part_path: Some("C:/dl/a.bin.faro-part".into()),
+            size: 100,
+            policy: "overwrite".into(),
+            remote_size: Some(100),
+            remote_etag: Some("\"e\"".into()),
+            remote_mtime: Some(5),
+            local_size: None,
+            local_mtime: None,
+            ranges_done: "[]".into(),
+            updated_at: 1,
+        };
+        db.resume_upsert(&row).unwrap();
+        db.resume_set_ranges("t1", "[[0,40]]").unwrap();
+        let got = db.resume_list().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].ranges_done, "[[0,40]]");
+        row.ranges_done = "[[0,40]]".into();
+        row.updated_at = got[0].updated_at;
+        assert_eq!(got[0], row);
+        db.resume_delete("t1").unwrap();
+        assert!(db.resume_list().unwrap().is_empty());
     }
 
     #[test]

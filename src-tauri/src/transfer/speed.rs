@@ -119,10 +119,6 @@ impl Live {
         self.last_progress_ms.store(now_ms(), Ordering::Relaxed);
     }
 
-    /// How long since a byte last moved.
-    pub fn idle_for(&self) -> Duration {
-        Duration::from_millis(now_ms().saturating_sub(self.last_progress_ms.load(Ordering::Relaxed)))
-    }
 }
 
 #[cfg(test)]

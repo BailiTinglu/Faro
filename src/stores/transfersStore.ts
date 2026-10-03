@@ -308,7 +308,12 @@ export const useTransfers = create<TransfersState>((set, get) => ({
   },
 
   resume: async (id) => {
-    await ipc.transferResume(id);
+    try {
+      await ipc.transferResume(id);
+    } catch (e) {
+      // A row restored from the last session needs its connection open.
+      toast.error("Can't resume yet", String(e));
+    }
   },
 
   retry: async (id) => {

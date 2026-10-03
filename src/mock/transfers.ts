@@ -110,6 +110,8 @@ export function handle(cmd: string, a: Record<string, any>): void {
       queue.throttleKbps = Math.max(0, a.kbps | 0);
       emitQueue();
       break;
+    case "transfer_set_segments":
+    case "transfer_set_verify":
     case "transfer_set_delta_sync":
       // Recorded in `calls` above; the mock has no delta engine to toggle.
       break;

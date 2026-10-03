@@ -183,13 +183,13 @@ async function main() {
     check("paused row shows Paused label", t.includes("Paused"), t.replace(/\n/g, " | "));
     check(
       "paused row offers Resume",
-      await drive((s) => !!window.__vt.btn(s, "Resume (restarts from byte 0)"), SRC.a1)
+      await drive((s) => !!window.__vt.btn(s, "Resume"), SRC.a1)
     );
     check(
       "pause invoked transfer_pause on the mock",
       (await drive((s) => window.__vt.calls("transfer_pause").map((c) => c.args.transferId), SRC.a1)).includes("a1")
     );
-    await drive((s) => window.__vt.click(s, "Resume (restarts from byte 0)"), SRC.a1);
+    await drive((s) => window.__vt.click(s, "Resume"), SRC.a1);
     await sleep(300);
     t = await rowText(SRC.a1);
     check("resumed row is transferring again (0%)", t.includes("0%"), t.replace(/\n/g, " | "));
@@ -358,6 +358,39 @@ async function main() {
       hdr8.match(/[\d.]+ MB\/s/g)?.join(",") ?? "none"
     );
     await shot("8-speed-eta");
+
+    // ---- 9. Plan 24: a row restored from the last session ----
+    await drive(() => {
+      window.__demo.seedTransfers(
+        [
+          {
+            id: "old1",
+            kind: "download",
+            source: "/srv/big/old.iso",
+            destination: "C:\\Users\\demo\\Downloads\\old.iso",
+            size: 1000,
+            transferred: 400,
+            status: "paused",
+            restored: true,
+            startedAt: Date.now(),
+          },
+        ],
+        { waiting: [] }
+      );
+      return window.__demo.useTransfers.getState().loadInitial();
+    });
+    await sleep(300);
+    t = await rowText("/srv/big/old.iso");
+    check("restored row shows Paused at its progress", t.includes("Paused") && t.includes("400 B"), t.replace(/\n/g, " | "));
+    check("restored row explains it needs its connection", t.includes("Open its connection, then resume"), t.replace(/\n/g, " | "));
+    check("restored row offers Resume", await drive(() => !!window.__vt.btn("/srv/big/old.iso", "Resume")));
+    await drive(() => window.__vt.click("/srv/big/old.iso", "Resume"));
+    await sleep(300);
+    check(
+      "Resume on a restored row invokes transfer_resume",
+      (await drive(() => window.__vt.calls("transfer_resume").map((c) => c.args.transferId))).includes("old1")
+    );
+    await shot("9-restored");
 
     if (failures === 0) console.log("\n✅ all transfer-queue checks passed");
     else console.log(`\n❌ ${failures} check(s) failed`);

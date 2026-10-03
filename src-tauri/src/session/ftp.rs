@@ -140,6 +140,65 @@ impl FtpStreamKind {
             Ok(copied)
         })
     }
+    /// Download `[offset, offset + len)` of `path` (`REST` + `RETR`), handing
+    /// each block to `emit` until `len` bytes went by, EOF, or `emit` returns
+    /// false. Stopping before EOF sends `ABOR`; if the server answers that
+    /// in a way suppaftp doesn't expect, the error is reported as a lost
+    /// connection so the session reconnects instead of reading out of step.
+    /// Returns the bytes emitted.
+    pub fn retr_range(
+        &mut self,
+        path: &str,
+        offset: u64,
+        len: u64,
+        mut emit: impl FnMut(&[u8]) -> bool,
+    ) -> Result<u64> {
+        use std::io::Read;
+        let lost = |e: FtpError| {
+            into_anyhow(FtpError::ConnectionError(std::io::Error::other(e.to_string())))
+        };
+        each!(self, s => {
+            if offset > 0 {
+                s.resume_transfer(offset as usize)
+                    .map_err(into_anyhow)
+                    .context("server refused REST (resume)")?;
+            }
+            let mut data = s.retr_as_stream(path).map_err(into_anyhow)?;
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut got = 0u64;
+            let mut early = false;
+            loop {
+                let want = buf.len().min(len.saturating_sub(got).min(usize::MAX as u64) as usize);
+                if want == 0 {
+                    // Got everything asked for: is the server done too?
+                    let mut probe = [0u8; 1];
+                    early = !matches!(data.read(&mut probe), Ok(0));
+                    break;
+                }
+                let n = data
+                    .read(&mut buf[..want])
+                    .map_err(|e| into_anyhow(FtpError::ConnectionError(e)))?;
+                if n == 0 {
+                    break;
+                }
+                got += n as u64;
+                if !emit(&buf[..n]) {
+                    early = true;
+                    break;
+                }
+            }
+            if early {
+                s.abort(data).map_err(lost)?;
+            } else {
+                s.finalize_retr_stream(data).map_err(into_anyhow)?;
+            }
+            Ok(got)
+        })
+    }
+    /// Last-modified time (`MDTM`) as Unix seconds.
+    pub fn mdtm_secs(&mut self, path: &str) -> Result<i64> {
+        each!(self, s => s.mdtm(path).map(|t| t.and_utc().timestamp()).map_err(into_anyhow))
+    }
     /// `REST <offset>`: make the next `RETR` start `offset` bytes in.
     pub fn restart_at(&mut self, offset: u64) -> Result<()> {
         each!(self, s => s.resume_transfer(offset as usize).map_err(into_anyhow))
@@ -295,6 +354,20 @@ fn auto_codec(host: String, state: Arc<AtomicU8>) -> TextCodec {
 impl FtpSession {
     pub fn supports_mlsd(&self) -> bool {
         self.mlsd
+    }
+
+    /// Parallel ranges one FTP download may use (each is its own login).
+    pub fn segments(&self) -> usize {
+        1
+    }
+
+    /// Run a transfer's data copy. Shares the control connection for now.
+    pub async fn with_transfer_stream<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut FtpStreamKind) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.with_stream(f).await
     }
 
     /// Run a closure with mutable access to the underlying FTP stream on a

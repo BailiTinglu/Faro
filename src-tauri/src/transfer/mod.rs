@@ -16,11 +16,18 @@ use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod live_tests;
+mod partfile;
+mod ranged;
+mod retry;
+mod sources;
 mod speed;
 
+pub use partfile::is_part_file;
 use speed::Live;
 
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum OverwritePolicy {
     #[default]
@@ -108,37 +115,6 @@ impl FtpGate {
 
     fn start(&self, offset: u64) -> std::io::Result<()> {
         self.send(FtpProgress::Start(offset))
-    }
-}
-
-/// Download sink: write through, reporting every `FTP_CHUNK` to the gate.
-struct GatedWriter<W: std::io::Write> {
-    inner: W,
-    gate: FtpGate,
-    pending: u64,
-}
-
-impl<W: std::io::Write> std::io::Write for GatedWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.pending += n as u64;
-        if self.pending >= FTP_CHUNK {
-            self.gate.send(FtpProgress::Chunk(std::mem::take(&mut self.pending)))?;
-        }
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl<W: std::io::Write> GatedWriter<W> {
-    /// Flush the file and report the final partial chunk.
-    fn finish(mut self) -> std::io::Result<()> {
-        self.inner.flush()?;
-        let rest = std::mem::take(&mut self.pending);
-        self.gate.send(FtpProgress::Chunk(rest))
     }
 }
 
@@ -304,11 +280,10 @@ pub struct Transfer {
     /// One-line note about the run, e.g. "remote changed, restarted".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
-    /// An earlier attempt of this transfer created (or truncated) the
-    /// destination and started writing it, so a partial file there is ours
-    /// to resume rather than someone else's file to overwrite. FTP only.
-    #[serde(skip)]
-    pub resumable: bool,
+    /// Loaded from `faro.db` at startup: an unfinished transfer from an
+    /// earlier session, waiting for its connection and a Resume.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub restored: bool,
 }
 
 impl Transfer {
@@ -339,7 +314,10 @@ enum RetryInfo {
     Download {
         session: Arc<Session>,
         remote_path: String,
-        final_path: PathBuf,
+        /// Where the file should end up; the policy is applied when the
+        /// finished temp is renamed into place (Plan 24 Phase 2).
+        target: PathBuf,
+        policy: OverwritePolicy,
     },
     Upload {
         session: Arc<Session>,
@@ -360,10 +338,6 @@ enum RetryInfo {
 /// Default bound on concurrently running transfers (Plan 17); the rest wait
 /// in the FIFO as `Queued`. Overridden by the `transferConcurrency` setting.
 const DEFAULT_CONCURRENCY: usize = 3;
-
-/// How many times a transfer auto-retries on transient (Network/Timeout)
-/// errors before surfacing the failure (Plan 17 Phase 3).
-const MAX_AUTO_RETRIES: u32 = 2;
 
 pub struct TransferManager {
     transfers: Mutex<HashMap<String, Transfer>>,
@@ -395,6 +369,120 @@ pub struct TransferManager {
     /// Lock-free counters of running transfers, read by the progress tick.
     live: std::sync::Mutex<HashMap<String, Arc<Live>>>,
     ticker: AtomicBool,
+    /// What each unfinished download already has on disk (Plan 24).
+    resumes: std::sync::Mutex<HashMap<String, ResumeState>>,
+    /// `.faro-part` paths in use, so two downloads of one target never share
+    /// a temp file.
+    parts: std::sync::Mutex<HashMap<PathBuf, String>>,
+    /// Paused object-store multipart uploads (see [`ObjectStash`]).
+    object_uploads: Mutex<HashMap<String, ObjectStash>>,
+    /// The `transferSegments` setting: max parallel ranges/parts per file,
+    /// 0 = auto.
+    segments: AtomicUsize,
+    /// The `transferVerify` setting (Phase 6).
+    verify: AtomicBool,
+    /// Where resume records persist (Phase 4); unset in unit tests.
+    db: std::sync::OnceLock<Arc<crate::db::Db>>,
+    /// Rows restored from `faro.db`, by transfer id, until resumed.
+    restored: Mutex<HashMap<String, crate::db::ResumeRow>>,
+}
+
+/// Bytes moved between resume checkpoints.
+const RESUME_SAVE_BYTES: u64 = 8 * 1024 * 1024;
+/// Longest gap between resume checkpoints while bytes move.
+const RESUME_SAVE_EVERY: Duration = Duration::from_secs(2);
+/// Ranges per file when `transferSegments` is `auto`, before probing.
+const AUTO_SEGMENTS: usize = 4;
+
+/// What an unfinished transfer already moved, and between which files.
+/// A download resumes only while the remote identity still matches; an
+/// upload only while the local source is unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ResumeState {
+    /// Downloads: byte ranges on disk. Uploads: `[0, n)` acknowledged.
+    pub ranges: ranged::Intervals,
+    /// Downloads: the remote file being fetched.
+    pub identity: sources::RemoteIdentity,
+    /// Downloads: the `.faro-part` temp.
+    pub part_path: Option<PathBuf>,
+    /// Uploads: the local source as it was when the upload started.
+    pub local: Option<LocalIdentity>,
+}
+
+/// Size and mtime of a local upload source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LocalIdentity {
+    pub size: u64,
+    pub mtime: i64,
+}
+
+async fn local_identity(path: &Path) -> Result<LocalIdentity> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("stat {}", path.display()))?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(LocalIdentity {
+        size: meta.len(),
+        mtime,
+    })
+}
+
+/// An object-store multipart upload kept open across a pause, so resuming
+/// sends only the parts not yet uploaded (within this app session;
+/// object_store can't list an upload's parts after a restart).
+struct ObjectStash {
+    guard: MultipartGuard,
+    offset: u64,
+    local: LocalIdentity,
+    key: String,
+}
+
+/// The Skip policy found the target already there when the download was
+/// ready to move into place: the row ends as Skipped, not Done.
+#[derive(Debug)]
+struct SkippedAtPlace;
+
+impl std::fmt::Display for SkippedAtPlace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("destination already exists; skipped")
+    }
+}
+
+impl std::error::Error for SkippedAtPlace {}
+
+/// The ranged engine's view of one transfer: the shared bandwidth bucket,
+/// the pause gates (no lock per chunk) and the live byte counter.
+struct TransferCtl {
+    mgr: Arc<TransferManager>,
+    gate: Option<PauseGate>,
+    live: Arc<Live>,
+}
+
+#[async_trait::async_trait]
+impl ranged::Ctl for TransferCtl {
+    async fn checkpoint(&self, bytes: u64) -> Result<()> {
+        self.mgr.bucket.acquire(bytes).await;
+        if self.mgr.pause_all.is_paused() || self.gate.as_ref().is_some_and(|g| g.is_paused()) {
+            return Err(Paused.into());
+        }
+        Ok(())
+    }
+
+    fn progressed(&self, bytes: u64) {
+        self.live.add(bytes);
+    }
+
+    fn rewound(&self, bytes: u64) {
+        let _ = self
+            .live
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| Some(b.saturating_sub(bytes)));
+    }
 }
 
 fn now_ts() -> i64 {
@@ -489,7 +577,329 @@ impl TransferManager {
             app: std::sync::OnceLock::new(),
             live: std::sync::Mutex::new(HashMap::new()),
             ticker: AtomicBool::new(false),
+            resumes: std::sync::Mutex::new(HashMap::new()),
+            parts: std::sync::Mutex::new(HashMap::new()),
+            object_uploads: Mutex::new(HashMap::new()),
+            segments: AtomicUsize::new(0),
+            verify: AtomicBool::new(false),
+            db: std::sync::OnceLock::new(),
+            restored: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Persist resume records in `db` (Plan 24 Phase 4).
+    pub fn set_db(&self, db: Arc<crate::db::Db>) {
+        let _ = self.db.set(db);
+    }
+
+    /// Bring back the unfinished transfers an earlier session left in
+    /// `faro.db`, as Paused rows with a Resume action. They need their
+    /// connection, so they wait for the user to open it and resume.
+    pub async fn restore(&self) {
+        let Some(db) = self.db.get() else { return };
+        let rows = match db.resume_list() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("loading unfinished transfers: {e:#}");
+                return;
+            }
+        };
+        for row in rows {
+            let download = row.kind == "download";
+            // A download whose temp is gone has nothing left to resume (it
+            // finished just before the app closed, or the user deleted it).
+            if download
+                && !row
+                    .part_path
+                    .as_deref()
+                    .is_some_and(|p| std::path::Path::new(p).exists())
+            {
+                let _ = db.resume_delete(&row.id);
+                continue;
+            }
+            let ranges: ranged::Intervals =
+                serde_json::from_str(&row.ranges_done).unwrap_or_default();
+            let t = Transfer {
+                id: row.id.clone(),
+                kind: if download {
+                    TransferKind::Download
+                } else {
+                    TransferKind::Upload
+                },
+                source: row.source.clone(),
+                destination: row.destination.clone(),
+                size: row.size,
+                transferred: ranges.total(),
+                status: TransferStatus::Paused,
+                error: None,
+                retry_attempt: None,
+                delta: None,
+                started_at: (row.updated_at / 1000).max(0),
+                bytes_per_sec: None,
+                eta_secs: None,
+                segments: None,
+                stalled: false,
+                notice: None,
+                restored: true,
+            };
+            let state = ResumeState {
+                ranges,
+                identity: sources::RemoteIdentity {
+                    size: row.remote_size,
+                    etag: row.remote_etag.clone(),
+                    mtime: row.remote_mtime,
+                },
+                part_path: row.part_path.as_ref().map(PathBuf::from),
+                local: match (row.local_size, row.local_mtime) {
+                    (Some(size), Some(mtime)) => Some(LocalIdentity { size, mtime }),
+                    _ => None,
+                },
+            };
+            if let Some(p) = &state.part_path {
+                self.parts
+                    .lock()
+                    .expect("part map")
+                    .insert(p.clone(), row.id.clone());
+            }
+            self.resumes
+                .lock()
+                .expect("resume map")
+                .insert(row.id.clone(), state);
+            self.pauses.lock().await.insert(row.id.clone(), PauseGate::new());
+            self.insert(t).await;
+            self.restored.lock().await.insert(row.id.clone(), row);
+        }
+    }
+
+    /// The connection (profile id) a restored row needs, if `id` is one.
+    pub async fn restored_connection(&self, id: &str) -> Option<String> {
+        self.restored
+            .lock()
+            .await
+            .get(id)
+            .map(|r| r.connection_id.clone())
+    }
+
+    /// Resume a row restored from an earlier session on `session` (the
+    /// now-open connection it belongs to).
+    pub async fn resume_restored(
+        self: &Arc<Self>,
+        id: &str,
+        session: Arc<Session>,
+        app: &AppHandle,
+    ) -> Result<()> {
+        self.set_app(app);
+        self.requeue_restored(id, session).await
+    }
+
+    async fn requeue_restored(self: &Arc<Self>, id: &str, session: Arc<Session>) -> Result<()> {
+        let row = self
+            .restored
+            .lock()
+            .await
+            .remove(id)
+            .ok_or_else(|| anyhow::anyhow!("transfer {id} is not waiting to be resumed"))?;
+        let job = if row.kind == "download" {
+            RetryInfo::Download {
+                session,
+                remote_path: row.source.clone(),
+                target: PathBuf::from(&row.destination),
+                policy: match row.policy.as_str() {
+                    "skip" => OverwritePolicy::Skip,
+                    "rename" => OverwritePolicy::Rename,
+                    _ => OverwritePolicy::Overwrite,
+                },
+            }
+        } else {
+            RetryInfo::Upload {
+                session,
+                local: PathBuf::from(&row.source),
+                final_remote: row.destination.clone(),
+            }
+        };
+        self.retry.lock().await.insert(id.to_string(), job.clone());
+        if let Some(g) = self.pauses.lock().await.get(id) {
+            g.set(false);
+        }
+        self.update(id, |t| {
+            t.status = TransferStatus::Queued;
+            t.restored = false;
+        })
+        .await;
+        if let Some(t) = self.get(id).await {
+            self.emit("transfer://updated", &t);
+        }
+        self.waiting.lock().await.push_back(id.to_string());
+        self.bump_queue_quiet().await;
+        let task = tokio::spawn(run_job(Arc::clone(self), id.to_string(), job));
+        self.tasks.lock().await.insert(id.to_string(), task);
+        Ok(())
+    }
+
+    /// The `faro.db` record for a transfer's resume state.
+    async fn resume_row(&self, id: &str, st: &ResumeState) -> Option<crate::db::ResumeRow> {
+        let t = self.get(id).await?;
+        let info = self.retry.lock().await.get(id).cloned()?;
+        let (session, destination, policy, kind) = match &info {
+            RetryInfo::Download {
+                session,
+                target,
+                policy,
+                ..
+            } => (
+                Arc::clone(session),
+                target.to_string_lossy().into_owned(),
+                *policy,
+                "download",
+            ),
+            RetryInfo::Upload { session, .. } => (
+                Arc::clone(session),
+                t.destination.clone(),
+                OverwritePolicy::Overwrite,
+                "upload",
+            ),
+            #[cfg(test)]
+            RetryInfo::Test(_) => return None,
+        };
+        Some(crate::db::ResumeRow {
+            id: id.to_string(),
+            connection_id: session.profile().id.clone(),
+            kind: kind.into(),
+            source: t.source.clone(),
+            destination,
+            part_path: st.part_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            size: t.size,
+            policy: serde_json::to_value(policy)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "overwrite".into()),
+            remote_size: st.identity.size,
+            remote_etag: st.identity.etag.clone(),
+            remote_mtime: st.identity.mtime,
+            local_size: st.local.map(|l| l.size),
+            local_mtime: st.local.map(|l| l.mtime),
+            ranges_done: serde_json::to_string(&st.ranges).unwrap_or_else(|_| "[]".into()),
+            updated_at: crate::db::now_ms(),
+        })
+    }
+
+    /// Live-adjust `transferSegments` (`None` = auto).
+    pub fn set_segments(&self, n: Option<usize>) {
+        self.segments
+            .store(n.map(|n| n.clamp(1, 16)).unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Live-adjust `transferVerify`.
+    pub fn set_verify(&self, on: bool) {
+        self.verify.store(on, Ordering::Relaxed);
+    }
+
+    fn verify_enabled(&self) -> bool {
+        self.verify.load(Ordering::Relaxed)
+    }
+
+    /// Max ranges per file and whether to auto-tune beyond it.
+    fn segment_cap(&self) -> (usize, bool) {
+        match self.segments.load(Ordering::Relaxed) {
+            0 => (AUTO_SEGMENTS, true),
+            n => (n, false),
+        }
+    }
+
+    async fn ctl(self: &Arc<Self>, id: &str) -> Arc<dyn ranged::Ctl> {
+        Arc::new(TransferCtl {
+            mgr: Arc::clone(self),
+            gate: self.pauses.lock().await.get(id).cloned(),
+            live: self.live(id),
+        })
+    }
+
+    fn resume_state(&self, id: &str) -> Option<ResumeState> {
+        self.resumes.lock().expect("resume map").get(id).cloned()
+    }
+
+    /// The temp file for `target`, unless another running download already
+    /// uses that name; then one tagged with this transfer's id.
+    fn claim_part_path(&self, id: &str, target: &Path) -> PathBuf {
+        let mut parts = self.parts.lock().expect("part map");
+        let mut path = partfile::part_path_for(target);
+        if parts.get(&path).is_some_and(|owner| owner != id) {
+            let tag = id.split('-').next().unwrap_or(id);
+            let mut name = target.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+            name.push(format!(".{tag}{}", partfile::PART_SUFFIX));
+            path = target.with_file_name(name);
+        }
+        parts.insert(path.clone(), id.to_string());
+        path
+    }
+
+    /// Record (or replace) a transfer's resume state, in memory and in
+    /// `faro.db`. Called before the temp file is created, so a crash never
+    /// leaves a `.faro-part` nothing knows about.
+    async fn store_resume(&self, id: &str, state: ResumeState) {
+        if let Some(db) = self.db.get() {
+            if let Some(row) = self.resume_row(id, &state).await {
+                if let Err(e) = db.resume_upsert(&row) {
+                    tracing::warn!("saving resume state for {id}: {e:#}");
+                }
+            }
+        }
+        if let Some(p) = &state.part_path {
+            self.parts
+                .lock()
+                .expect("part map")
+                .insert(p.clone(), id.to_string());
+        }
+        self.resumes
+            .lock()
+            .expect("resume map")
+            .insert(id.to_string(), state);
+    }
+
+    /// Update the ranges on disk. Call only after the data was synced (or
+    /// acknowledged): the record must never claim bytes that aren't there.
+    async fn save_ranges(&self, id: &str, ranges: ranged::Intervals) {
+        if let Some(db) = self.db.get() {
+            let json = serde_json::to_string(&ranges).unwrap_or_else(|_| "[]".into());
+            if let Err(e) = db.resume_set_ranges(id, &json) {
+                tracing::warn!("saving resume progress for {id}: {e:#}");
+            }
+        }
+        if let Some(st) = self.resumes.lock().expect("resume map").get_mut(id) {
+            st.ranges = ranges;
+        }
+    }
+
+    /// Drop a download's resume state; `delete_part` also removes the temp
+    /// (cancel, or a remote that changed).
+    async fn forget_resume(&self, id: &str, delete_part: bool) {
+        if let Some(db) = self.db.get() {
+            if let Err(e) = db.resume_delete(id) {
+                tracing::warn!("clearing resume state for {id}: {e:#}");
+            }
+        }
+        self.restored.lock().await.remove(id);
+        let st = self.resumes.lock().expect("resume map").remove(id);
+        if let Some(path) = st.and_then(|st| st.part_path) {
+            self.parts.lock().expect("part map").remove(&path);
+            if delete_part {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+        // An unfinished multipart upload is aborted when its stash drops.
+        self.object_uploads.lock().await.remove(id);
+    }
+
+    /// Integrity checks beyond size and range coverage (Phase 6).
+    async fn verify_download(
+        &self,
+        _id: &str,
+        _session: &Arc<Session>,
+        _remote_path: &str,
+        _ident: &sources::RemoteIdentity,
+        _finished: &partfile::Finished,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// The live counters for `id`, created on first use.
@@ -822,6 +1232,9 @@ impl TransferManager {
     /// Resume a paused transfer. A parked one re-runs its file from byte 0;
     /// a queued one re-enters FIFO admission.
     pub async fn resume(&self, id: &str, app: &AppHandle) -> Result<()> {
+        if self.restored.lock().await.contains_key(id) {
+            anyhow::bail!("transfer {id} needs its connection: use resume_restored");
+        }
         if self.get(id).await.map(|t| t.status) != Some(TransferStatus::Paused) {
             anyhow::bail!("transfer {id} is not paused");
         }
@@ -839,7 +1252,6 @@ impl TransferManager {
             } else {
                 TransferStatus::Transferring
             };
-            t.transferred = 0;
         })
         .await;
         gate.set(false);
@@ -875,9 +1287,9 @@ impl TransferManager {
         }
         self.update(id, |t| {
             t.status = TransferStatus::Queued;
-            t.transferred = 0;
             t.error = None;
             t.retry_attempt = None;
+            t.notice = None;
         })
         .await;
         if let Some(t) = self.get(id).await {
@@ -940,6 +1352,8 @@ impl TransferManager {
             h.abort();
         }
         self.drop_live(id);
+        // Cancel discards the partial download (pause and error keep it).
+        self.forget_resume(id, true).await;
         self.update(id, |t| {
             if matches!(
                 t.status,
@@ -969,6 +1383,10 @@ impl TransferManager {
         let size = remote_size(&session, &remote_path).await.unwrap_or(0);
 
         let initial = PathBuf::from(&local_dir).join(basename(&remote_path));
+        // Skip is decided now (no point downloading a file we'll drop) and
+        // again at rename time; Rename shows its likely name now and picks a
+        // free one at rename time; Overwrite only replaces the existing file
+        // once the new one is complete.
         let (final_path, skip) = match policy {
             OverwritePolicy::Overwrite => (initial, false),
             OverwritePolicy::Skip => {
@@ -1000,7 +1418,7 @@ impl TransferManager {
             segments: None,
             stalled: false,
             notice: None,
-            resumable: false,
+            restored: false,
         };
         self.insert(transfer.clone()).await;
         let _ = app.emit("transfer://added", &transfer);
@@ -1015,7 +1433,8 @@ impl TransferManager {
             RetryInfo::Download {
                 session: Arc::clone(&session),
                 remote_path: remote_path.clone(),
-                final_path: final_path.clone(),
+                target: final_path.clone(),
+                policy,
             },
         );
         self.waiting.lock().await.push_back(id.clone());
@@ -1032,94 +1451,6 @@ impl TransferManager {
         let task = tokio::spawn(run_job(Arc::clone(self), id.clone(), job));
         self.tasks.lock().await.insert(id.clone(), task);
         Ok(id)
-    }
-
-    /// Stream a download from a Faro Agent daemon by ranged `ReadChunk`s. The
-    /// daemon caps each chunk; we advance the offset until it reports EOF.
-    /// `app` is optional so tests can drive the loop without an `AppHandle`
-    /// (a test binary that links tauri's mock runtime pulls an unmanifested
-    /// `TaskDialogIndirect` import and fails to launch on Windows); `None`
-    /// just skips the progress events.
-    async fn agent_download_core(
-        &self,
-        id: &str,
-        session: &Arc<crate::session::AgentSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        use base64::Engine as _;
-        use faro_agent_proto::msg::{Request, Response};
-        self.update(id, |t| t.status = TransferStatus::Transferring).await;
-
-        let mut local_file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        let mut offset: u64 = 0;
-        loop {
-            let resp = session
-                .request(Request::ReadChunk { path: remote_path.to_string(), offset, len: 0 })
-                .await?;
-            let (data_b64, eof) = match resp {
-                Response::Chunk { data, eof } => (data, eof),
-                Response::Error { message, .. } => {
-                    return Err(anyhow::anyhow!("download {remote_path}: {message}"))
-                }
-                other => return Err(anyhow::anyhow!("download {remote_path}: unexpected {other:?}")),
-            };
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(&data_b64)
-                .context("decode chunk")?;
-            self.checkpoint(id, bytes.len() as u64).await?;
-            if !bytes.is_empty() {
-                local_file.write_all(&bytes).await?;
-                offset += bytes.len() as u64;
-                self.progress(id, offset);
-            }
-            if eof {
-                break;
-            }
-        }
-        local_file.flush().await?;
-        self.update(id, |t| t.transferred = offset).await;
-        Ok(offset)
-    }
-
-    async fn run_ssh_download(
-        &self,
-        id: &str,
-        session: Arc<SshSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        let sftp_cell = session.ensure_sftp().await?;
-        let mut remote_file = {
-            let sftp = sftp_cell.lock().await;
-            sftp.open(remote_path)
-                .await
-                .with_context(|| format!("open remote {remote_path}"))?
-        };
-        let mut local_file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut transferred: u64 = 0;
-        loop {
-            let n = remote_file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            self.checkpoint(id, n as u64).await?;
-            local_file.write_all(&buf[..n]).await?;
-            transferred += n as u64;
-            self.progress(id, transferred);
-        }
-        local_file.flush().await?;
-        self.update(id, |t| t.transferred = transferred).await;
-        Ok(transferred)
     }
 
     pub async fn start_upload(
@@ -1166,7 +1497,7 @@ impl TransferManager {
             segments: None,
             stalled: false,
             notice: None,
-            resumable: false,
+            restored: false,
         };
         self.insert(transfer.clone()).await;
         let _ = app.emit("transfer://added", &transfer);
@@ -1447,47 +1778,236 @@ impl TransferManager {
         Ok(size)
     }
 
-    /// Agent download entry point (delta-sync Phase 2): mirror of
-    /// [`Self::run_agent_upload_with_delta`].
-    async fn run_agent_download_with_delta(
-        &self,
-        id: &str,
-        session: Arc<crate::session::AgentSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        self.agent_download_with_delta_core(id, &session, remote_path, local_path)
-            .await
-    }
-
-    /// Gate + fallback logic behind [`Self::run_agent_download_with_delta`];
-    /// `app: None` (tests) skips progress events.
-    async fn agent_download_with_delta_core(
+    /// Agent delta download (Plan 23), when the switch is on, a local basis
+    /// exists and the file is big enough. `None` means "not attempted or
+    /// failed": the caller downloads the whole file instead.
+    async fn try_agent_delta_download(
         &self,
         id: &str,
         session: &Arc<crate::session::AgentSession>,
         remote_path: &str,
         local_path: &Path,
-    ) -> Result<u64> {
+    ) -> Option<u64> {
         let (size, remote_exists) = agent_stat(session, remote_path).await;
         let basis_exists = tokio::fs::metadata(local_path).await.is_ok();
-        if remote_exists
+        if !(remote_exists
             && self.delta_enabled()
-            && faro_agent_proto::delta::should_attempt_delta(size, basis_exists, true)
+            && faro_agent_proto::delta::should_attempt_delta(size, basis_exists, true))
         {
-            match self
-                .agent_delta_download_core(id, session, remote_path, local_path)
-                .await
-            {
-                Ok(n) => return Ok(n),
-                Err(e) => {
-                    tracing::warn!("delta download fell back to whole-file copy: {e:#}");
-                    self.update(id, |t| t.transferred = 0).await;
+            return None;
+        }
+        match self
+            .agent_delta_download_core(id, session, remote_path, local_path)
+            .await
+        {
+            Ok(n) => Some(n),
+            Err(e) => {
+                tracing::warn!("delta download fell back to whole-file copy: {e:#}");
+                self.progress(id, 0);
+                None
+            }
+        }
+    }
+
+    /// The download pipeline (Plan 24): bytes land in a preallocated
+    /// `.faro-part` through the ranged engine, which is then synced and
+    /// renamed over the target (the overwrite policy applies at that point).
+    /// A remote that changed under a resumed or running download restarts
+    /// once from byte 0 with a notice on the row.
+    async fn run_download(
+        self: &Arc<Self>,
+        id: &str,
+        session: &Arc<Session>,
+        remote_path: &str,
+        target: &Path,
+        policy: OverwritePolicy,
+    ) -> Result<u64> {
+        self.update(id, |t| t.status = TransferStatus::Transferring)
+            .await;
+        if let Session::Agent(agent) = &**session {
+            if policy == OverwritePolicy::Overwrite {
+                if let Some(n) = self
+                    .try_agent_delta_download(id, agent, remote_path, target)
+                    .await
+                {
+                    return Ok(n);
                 }
             }
         }
-        self.agent_download_core(id, session, remote_path, local_path)
+        let mut restarted = false;
+        loop {
+            match self
+                .download_once(id, session, remote_path, target, policy)
+                .await
+            {
+                Err(e) if !restarted && e.chain().any(|c| c.is::<retry::RemoteChanged>()) => {
+                    restarted = true;
+                    tracing::info!("{remote_path} changed during download; restarting");
+                    self.forget_resume(id, true).await;
+                    self.set_notice(id, "remote changed, restarted").await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Agent download as the runner does it (tests drive this directly).
+    #[cfg(test)]
+    async fn agent_download_with_delta_core(
+        self: &Arc<Self>,
+        id: &str,
+        session: &Arc<crate::session::AgentSession>,
+        remote_path: &str,
+        local_path: &Path,
+    ) -> Result<u64> {
+        let session = Arc::new(Session::Agent(Arc::clone(session)));
+        self.run_download(id, &session, remote_path, local_path, OverwritePolicy::Overwrite)
             .await
+    }
+
+    async fn set_notice(&self, id: &str, notice: &str) {
+        self.update(id, |t| t.notice = Some(notice.to_string())).await;
+        if let Some(t) = self.get(id).await {
+            self.emit("transfer://updated", &t);
+        }
+    }
+
+    /// One pass of [`Self::run_download`].
+    async fn download_once(
+        self: &Arc<Self>,
+        id: &str,
+        session: &Arc<Session>,
+        remote_path: &str,
+        target: &Path,
+        policy: OverwritePolicy,
+    ) -> Result<u64> {
+        use ranged::{DriverConfig, DriverState, Intervals, UNBOUNDED};
+        let live = self.live(id);
+        let ident = sources::remote_identity(session, remote_path).await?;
+        let enqueued_size = self.get(id).await.map(|t| t.size).unwrap_or(0);
+        let size = if sources::size_is_advisory(session) {
+            None
+        } else {
+            ident.size.or((enqueued_size > 0).then_some(enqueued_size))
+        };
+        if let Some(s) = size {
+            self.update(id, |t| t.size = s).await;
+        }
+        let source = sources::source_for(session, remote_path, &ident).await?;
+
+        // Resume only onto the very same remote file, and only through a
+        // source that can start mid-file.
+        let prev = self.resume_state(id);
+        let part_path = match prev.as_ref().and_then(|p| p.part_path.clone()) {
+            Some(p) => p,
+            None => self.claim_part_path(id, target),
+        };
+        let mut done = Intervals::default();
+        if let Some(prev) = &prev {
+            let on_disk = std::fs::metadata(&part_path).is_ok();
+            if !prev.identity.matches(&ident) {
+                if prev.ranges.total() > 0 {
+                    self.set_notice(id, "remote changed, restarted").await;
+                }
+            } else if on_disk && source.seekable() {
+                done = if size.is_some() {
+                    prev.ranges.clone()
+                } else {
+                    let mut p = Intervals::default();
+                    p.add(0, prev.ranges.prefix());
+                    p
+                };
+            }
+        }
+        self.store_resume(
+            id,
+            ResumeState {
+                ranges: done.clone(),
+                identity: ident.clone(),
+                part_path: Some(part_path.clone()),
+                local: None,
+            },
+        )
+        .await;
+        let part = partfile::PartFile::open(&part_path, size, done.total() > 0, self.verify_enabled())
+            .await?;
+
+        let state = Arc::new(DriverState::default());
+        state.seed(&done);
+        live.set(done.total());
+        let total = size.unwrap_or(UNBOUNDED);
+        let todo = if total == UNBOUNDED {
+            vec![(done.prefix(), UNBOUNDED)]
+        } else {
+            done.gaps(total)
+        };
+        let (cap, auto) = self.segment_cap();
+        let driver = ranged::segmented_download(
+            source,
+            part.writer(),
+            self.ctl(id).await,
+            Arc::clone(&state),
+            todo,
+            DriverConfig::new(total, cap, auto),
+        );
+        tokio::pin!(driver);
+
+        // Mirror the driver's live state onto the row, and checkpoint the
+        // resume record every 8 MiB or 2 s: sync the file first, then record
+        // only what was handed to the writer before that sync.
+        let mut every = tokio::time::interval(Duration::from_millis(250));
+        let mut saved = (Instant::now(), done.total());
+        let res = loop {
+            tokio::select! {
+                r = &mut driver => break r,
+                _ = every.tick() => {
+                    live.segments.store(
+                        match state.workers.load(Ordering::Relaxed) { 0 | 1 => 0, n => n },
+                        Ordering::Relaxed,
+                    );
+                    live.stalled.store(state.stalled.load(Ordering::Relaxed), Ordering::Relaxed);
+                    let snap = state.snapshot();
+                    let moved = snap.total().saturating_sub(saved.1);
+                    if moved >= RESUME_SAVE_BYTES || (moved > 0 && saved.0.elapsed() >= RESUME_SAVE_EVERY) {
+                        if part.sync().await.is_ok() {
+                            self.save_ranges(id, snap.clone()).await;
+                        }
+                        saved = (Instant::now(), snap.total());
+                    }
+                }
+            }
+        };
+        live.segments.store(0, Ordering::Relaxed);
+        live.stalled.store(false, Ordering::Relaxed);
+        if let Err(e) = res {
+            let snap = state.snapshot();
+            if part.sync().await.is_ok() {
+                self.save_ranges(id, snap).await;
+            }
+            return Err(e);
+        }
+        let written = state.snapshot().total();
+        let finished = part.finish().await?;
+        if size.is_none() && finished.len != written {
+            anyhow::bail!(
+                "download incomplete: wrote {written} bytes but the file holds {}",
+                finished.len
+            );
+        }
+        self.verify_download(id, session, remote_path, &ident, &finished)
+            .await?;
+        let placed = partfile::place(&part_path, target, policy, ident.mtime_systime()).await?;
+        self.forget_resume(id, false).await;
+        match placed {
+            partfile::Placed::At(dest) => {
+                if dest != target {
+                    let shown = dest.to_string_lossy().into_owned();
+                    self.update(id, |t| t.destination = shown).await;
+                }
+                Ok(written)
+            }
+            partfile::Placed::Skipped => Err(SkippedAtPlace.into()),
+        }
     }
 
     /// Download from a Faro Agent daemon as a block-level delta: fetch the
@@ -1661,6 +2181,10 @@ impl TransferManager {
         Ok(size)
     }
 
+    /// SFTP upload (Plan 24) on its own channel with up to 32 writes in
+    /// flight, written in 256 KiB blocks. Resumes at the acknowledged offset
+    /// when this transfer already wrote part of the remote file and the
+    /// local source hasn't changed since.
     async fn run_ssh_upload(
         &self,
         id: &str,
@@ -1668,36 +2192,254 @@ impl TransferManager {
         local_path: &Path,
         remote_path: &str,
     ) -> Result<u64> {
+        use russh_sftp::protocol::OpenFlags;
+        use tokio::io::AsyncSeekExt;
         self.update(id, |t| t.status = TransferStatus::Transferring)
             .await;
+        let local = local_identity(local_path).await?;
 
-        let sftp_cell = session.ensure_sftp().await?;
-        let mut remote_file = {
-            let sftp = sftp_cell.lock().await;
+        // A dedicated channel, or the shared browsing one if the server
+        // won't open another (MaxSessions).
+        let dedicated = match session.open_upload_sftp().await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!("SFTP: no dedicated upload channel ({e:#}); using the shared one");
+                None
+            }
+        };
+        let shared = match dedicated {
+            Some(_) => None,
+            None => Some(session.ensure_sftp().await?),
+        };
+        let shared_guard = match &shared {
+            Some(cell) => Some(cell.lock().await),
+            None => None,
+        };
+        let sftp: &russh_sftp::client::SftpSession = match (&dedicated, &shared_guard) {
+            (Some(s), _) => s,
+            (None, Some(g)) => g,
+            (None, None) => unreachable!("one SFTP session is always set"),
+        };
+
+        let prev = self.resume_state(id);
+        if prev
+            .as_ref()
+            .is_some_and(|p| p.local != Some(local) && p.ranges.total() > 0)
+        {
+            self.set_notice(id, "local file changed, restarted").await;
+        }
+        let prev = prev.filter(|p| p.local == Some(local));
+        let mut start = 0;
+        if let Some(prev) = &prev {
+            let acked = prev.ranges.prefix();
+            if acked > 0 {
+                if let Ok(meta) = sftp.metadata(remote_path).await {
+                    if meta.size.unwrap_or(0) >= acked {
+                        start = acked;
+                    }
+                }
+            }
+        }
+        let mut remote_file = if start > 0 {
+            let mut f = sftp
+                .open_with_flags(remote_path, OpenFlags::WRITE)
+                .await
+                .with_context(|| format!("open remote {remote_path}"))?;
+            f.seek(std::io::SeekFrom::Start(start)).await?;
+            f
+        } else {
             sftp.create(remote_path)
                 .await
                 .with_context(|| format!("create remote {remote_path}"))?
         };
+        let mut done = ranged::Intervals::default();
+        done.add(0, start);
+        self.store_resume(
+            id,
+            ResumeState {
+                ranges: done,
+                local: Some(local),
+                ..Default::default()
+            },
+        )
+        .await;
+
         let mut local_file = tokio::fs::File::open(local_path)
             .await
             .with_context(|| format!("open {}", local_path.display()))?;
-
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut transferred: u64 = 0;
-        loop {
-            let n = local_file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            self.checkpoint(id, n as u64).await?;
-            remote_file.write_all(&buf[..n]).await?;
-            transferred += n as u64;
-            self.progress(id, transferred);
+        if start > 0 {
+            local_file.seek(std::io::SeekFrom::Start(start)).await?;
         }
-        remote_file.flush().await?;
-        self.update(id, |t| t.transferred = transferred).await;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut transferred = start;
+        let mut saved = (Instant::now(), start);
+        self.progress(id, transferred);
+        let res: Result<()> = async {
+            loop {
+                let n = local_file.read(&mut buf).await?;
+                if n == 0 {
+                    return Ok(());
+                }
+                self.checkpoint(id, n as u64).await?;
+                remote_file.write_all(&buf[..n]).await?;
+                transferred += n as u64;
+                self.progress(id, transferred);
+                if transferred - saved.1 >= RESUME_SAVE_BYTES || saved.0.elapsed() >= RESUME_SAVE_EVERY {
+                    // Wait for the server's acks before recording progress.
+                    remote_file.flush().await?;
+                    let mut iv = ranged::Intervals::default();
+                    iv.add(0, transferred);
+                    self.save_ranges(id, iv).await;
+                    saved = (Instant::now(), transferred);
+                }
+            }
+        }
+        .await;
+        if let Err(e) = res {
+            if is_paused(&e) && remote_file.flush().await.is_ok() {
+                let mut iv = ranged::Intervals::default();
+                iv.add(0, transferred);
+                self.save_ranges(id, iv).await;
+            }
+            return Err(e);
+        }
+        remote_file.shutdown().await?;
+        self.forget_resume(id, false).await;
         Ok(transferred)
     }
+
+    /// Object-store upload. Small files go up in one PUT; larger ones as a
+    /// multipart upload with up to `transferSegments` parts in flight (the
+    /// old loop sent one part at a time). Parts are at least 8 MiB and big
+    /// enough to stay under S3's 10,000-part limit. A pause keeps the
+    /// multipart upload open so resuming sends only the remaining parts; an
+    /// error or cancel aborts it so no orphaned parts are left behind.
+    async fn run_object_upload(
+        &self,
+        id: &str,
+        session: Arc<ObjectSession>,
+        local_path: &Path,
+        remote_path: &str,
+    ) -> Result<u64> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use tokio::io::AsyncSeekExt;
+
+        self.update(id, |t| t.status = TransferStatus::Transferring)
+            .await;
+        let key = remote_path.trim_start_matches('/').to_string();
+        let p = object_store::path::Path::from(key.as_str());
+        let local = local_identity(local_path).await?;
+        let size = local.size;
+        let mut file = tokio::fs::File::open(local_path)
+            .await
+            .with_context(|| format!("open {}", local_path.display()))?;
+
+        if size <= OBJECT_SINGLE_PUT_MAX {
+            // object_store needs the body in memory; 16 MiB at most.
+            self.checkpoint(id, size).await?;
+            let mut buf = Vec::with_capacity(size as usize);
+            file.read_to_end(&mut buf).await?;
+            session
+                .store
+                .put(&p, bytes::Bytes::from(buf).into())
+                .await
+                .with_context(|| format!("s3 put {key}"))?;
+            self.progress(id, size);
+            return Ok(size);
+        }
+
+        let part_size = object_part_size(size);
+        let (cap, _) = self.segment_cap();
+        // Continue a paused multipart upload of the same, unchanged file.
+        let stash = self
+            .object_uploads
+            .lock()
+            .await
+            .remove(id)
+            .filter(|s| s.local == local && s.key == key);
+        let (mut upload, mut offset) = match stash {
+            Some(s) => (s.guard, s.offset),
+            None => {
+                let up = session
+                    .store
+                    .put_multipart(&p)
+                    .await
+                    .with_context(|| format!("s3 begin multipart {key}"))?;
+                (MultipartGuard::new(up, key.clone()), 0)
+            }
+        };
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        self.progress(id, offset);
+
+        let mut inflight = FuturesUnordered::new();
+        // Bytes read and handed to put_part, and bytes confirmed uploaded.
+        let mut sent = offset;
+        let res: Result<()> = async {
+            loop {
+                while inflight.len() < cap && sent < size {
+                    let want = part_size.min(size - sent) as usize;
+                    let mut buf = vec![0u8; want];
+                    file.read_exact(&mut buf).await?;
+                    self.checkpoint(id, want as u64).await?;
+                    let part = upload.get().put_part(bytes::Bytes::from(buf).into());
+                    sent += want as u64;
+                    inflight.push(async move { part.await.map(|()| want as u64) });
+                }
+                self.live(id).segments.store(
+                    if inflight.len() > 1 { inflight.len() } else { 0 },
+                    Ordering::Relaxed,
+                );
+                match inflight.next().await {
+                    None => return Ok(()),
+                    Some(r) => {
+                        offset += r.with_context(|| format!("s3 put_part {key}"))?;
+                        self.progress(id, offset);
+                    }
+                }
+            }
+        }
+        .await;
+        self.live(id).segments.store(0, Ordering::Relaxed);
+        if let Err(e) = res {
+            if is_paused(&e) {
+                // Let the parts already sent finish, then keep the upload.
+                let mut drained = Ok(());
+                while let Some(r) = inflight.next().await {
+                    match r {
+                        Ok(n) => offset += n,
+                        Err(e) => drained = Err(e),
+                    }
+                }
+                if drained.is_ok() && offset == sent {
+                    self.progress(id, offset);
+                    self.object_uploads.lock().await.insert(
+                        id.to_string(),
+                        ObjectStash {
+                            guard: upload,
+                            offset,
+                            local,
+                            key,
+                        },
+                    );
+                }
+            }
+            return Err(e);
+        }
+        upload
+            .complete()
+            .await
+            .with_context(|| format!("s3 complete multipart {key}"))?;
+        Ok(offset)
+    }
+}
+
+/// Largest object uploaded with a single PUT.
+const OBJECT_SINGLE_PUT_MAX: u64 = 16 * 1024 * 1024;
+
+/// Multipart part size: at least 8 MiB, and large enough that the file fits
+/// in 9,000 parts (S3 allows 10,000).
+fn object_part_size(size: u64) -> u64 {
+    (8 * 1024 * 1024).max(size.div_ceil(9_000))
 }
 
 impl TransferManager {
@@ -1722,8 +2464,25 @@ impl TransferManager {
         let mut dirs_to_visit: Vec<String> = vec![remote_root.clone()];
         let mut files: Vec<(String, PathBuf)> = Vec::new();
 
+        let mut ids = Vec::new();
         while let Some(d) = dirs_to_visit.pop() {
-            let entries = fs.list_dir(&d).await.with_context(|| format!("read_dir {d}"))?;
+            // The root must list; an unreadable subfolder becomes an Error row
+            // and the rest of the batch still runs (Plan 24 Phase 5).
+            let entries = match fs.list_dir(&d).await {
+                Ok(e) => e,
+                Err(e) if d != remote_root => {
+                    let local = local_root.join(
+                        d.strip_prefix(&remote_root).unwrap_or(&d).trim_start_matches('/'),
+                    );
+                    let err = e.context(format!("read_dir {d}"));
+                    ids.push(
+                        self.failed_row(TransferKind::Download, &d, &local.to_string_lossy(), &err, &app)
+                            .await,
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e.context(format!("read_dir {d}"))),
+            };
             for entry in entries {
                 let remote_child = entry.path.clone();
                 let rel = remote_child
@@ -1744,24 +2503,72 @@ impl TransferManager {
             }
         }
 
-        let mut ids = Vec::with_capacity(files.len());
         for (remote_path, local_path) in files {
             let parent_dir = local_path
                 .parent()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| ".".into());
-            let id = self
+            match self
                 .start_download(
                     Arc::clone(&session),
-                    remote_path,
+                    remote_path.clone(),
                     parent_dir,
                     policy,
                     app.clone(),
                 )
-                .await?;
-            ids.push(id);
+                .await
+            {
+                Ok(id) => ids.push(id),
+                Err(e) => ids.push(
+                    self.failed_row(
+                        TransferKind::Download,
+                        &remote_path,
+                        &local_path.to_string_lossy(),
+                        &e,
+                        &app,
+                    )
+                    .await,
+                ),
+            }
         }
         Ok(ids)
+    }
+
+    /// A row for an item of a folder transfer that couldn't even be queued
+    /// (unreadable folder, failed stat): it shows as an Error row while the
+    /// rest of the batch runs.
+    async fn failed_row(
+        &self,
+        kind: TransferKind,
+        source: &str,
+        destination: &str,
+        err: &anyhow::Error,
+        app: &AppHandle,
+    ) -> String {
+        self.set_app(app);
+        let id = Uuid::new_v4().to_string();
+        let t = Transfer {
+            id: id.clone(),
+            kind,
+            source: source.to_string(),
+            destination: destination.to_string(),
+            size: 0,
+            transferred: 0,
+            status: TransferStatus::Error,
+            error: Some(format!("{err:#}")),
+            retry_attempt: None,
+            delta: None,
+            started_at: now_ts(),
+            bytes_per_sec: None,
+            eta_secs: None,
+            segments: None,
+            stalled: false,
+            notice: None,
+            restored: false,
+        };
+        self.insert(t.clone()).await;
+        self.emit("transfer://added", &t);
+        id
     }
 
     pub async fn start_directory_upload(
@@ -1787,10 +2594,19 @@ impl TransferManager {
         let mut dirs_to_visit: Vec<PathBuf> = vec![local_root_path.clone()];
         let mut files: Vec<(PathBuf, String)> = Vec::new();
         let mut subdirs: Vec<String> = Vec::new();
+        let mut unreadable: Vec<(PathBuf, anyhow::Error)> = Vec::new();
         while let Some(d) = dirs_to_visit.pop() {
-            let mut rd = tokio::fs::read_dir(&d)
-                .await
-                .with_context(|| format!("read_dir {}", d.display()))?;
+            let mut rd = match tokio::fs::read_dir(&d).await {
+                Ok(rd) => rd,
+                Err(e) if d != local_root_path => {
+                    let err = anyhow::Error::new(e).context(format!("read_dir {}", d.display()));
+                    unreadable.push((d, err));
+                    continue;
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(format!("read_dir {}", d.display())))
+                }
+            };
             while let Some(entry) = rd.next_entry().await? {
                 let p = entry.path();
                 let meta = match entry.metadata().await {
@@ -1812,18 +2628,32 @@ impl TransferManager {
             }
         }
 
+        let mut failed = Vec::new();
+        for (d, err) in unreadable {
+            let rel = d
+                .strip_prefix(&local_root_path)
+                .unwrap_or(&d)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let remote = format!("{remote_root}/{rel}");
+            failed.push(
+                self.failed_row(TransferKind::Upload, &d.to_string_lossy(), &remote, &err, &app)
+                    .await,
+            );
+        }
+
         subdirs.sort_by_key(|s| s.matches('/').count());
         for sd in subdirs {
             let _ = fs.create_dir(&sd).await;
         }
 
-        let mut ids = Vec::with_capacity(files.len());
+        let mut ids = failed;
         for (local_path, remote_path) in files {
             let parent = remote_path
                 .rsplit_once('/')
                 .map(|(p, _)| p.to_string())
                 .unwrap_or_else(|| remote_root.clone());
-            let id = self
+            match self
                 .start_upload(
                     Arc::clone(&session),
                     local_path.to_string_lossy().into_owned(),
@@ -1831,67 +2661,22 @@ impl TransferManager {
                     policy,
                     app.clone(),
                 )
-                .await?;
-            ids.push(id);
+                .await
+            {
+                Ok(id) => ids.push(id),
+                Err(e) => ids.push(
+                    self.failed_row(
+                        TransferKind::Upload,
+                        &local_path.to_string_lossy(),
+                        &remote_path,
+                        &e,
+                        &app,
+                    )
+                    .await,
+                ),
+            }
         }
         Ok(ids)
-    }
-
-    /// FTP download. suppaftp is blocking, so the copy runs on a blocking
-    /// thread and reports every `FTP_CHUNK` through `ftp_pump`, which applies
-    /// the same throttle/pause checkpoint and progress events as the other
-    /// backends. A retry of a transfer that already started resumes from the
-    /// partial file with `REST` instead of starting over.
-    async fn run_ftp_download(
-        &self,
-        id: &str,
-        session: Arc<FtpSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-        self.checkpoint(id, 0).await?;
-
-        let resumable = self.get(id).await.is_some_and(|t| t.resumable);
-        let offset = if resumable {
-            std::fs::metadata(local_path).map(|m| m.len()).unwrap_or(0)
-        } else {
-            0
-        };
-
-        let (gate, rx, ack) = FtpGate::new();
-        let path = local_path.to_path_buf();
-        let remote = remote_path.to_string();
-        let copy = session.with_stream(move |stream| {
-            // Fall back to a full download if the server refuses REST.
-            let start = if offset > 0 && stream.restart_at(offset).is_ok() {
-                offset
-            } else {
-                0
-            };
-            let file = if start > 0 {
-                std::fs::OpenOptions::new().append(true).open(&path)
-            } else {
-                std::fs::File::create(&path)
-            }
-            .with_context(|| format!("open {}", path.display()))?;
-            gate.start(start)?;
-            let mut sink = GatedWriter {
-                inner: std::io::BufWriter::new(file),
-                gate,
-                pending: 0,
-            };
-            stream.retr_to_writer(&remote, &mut sink)?;
-            sink.finish()?;
-            Ok(())
-        });
-        let (res, (stop, done)) = tokio::join!(copy, self.ftp_pump(id, rx, ack));
-        // A pause/cancel at a checkpoint is the real reason the copy failed.
-        if let Some(e) = stop {
-            return Err(e);
-        }
-        res.map(|()| done)
     }
 
     /// FTP upload: like the download, with `APPE` from the remote file's
@@ -1908,7 +2693,17 @@ impl TransferManager {
             .await;
         self.checkpoint(id, 0).await?;
 
-        let resumable = self.get(id).await.is_some_and(|t| t.resumable);
+        // Resume only an upload this transfer already started (it has a
+        // resume record) of the same, unchanged local file.
+        let local_id = local_identity(local_path).await?;
+        let prev = self.resume_state(id);
+        if prev
+            .as_ref()
+            .is_some_and(|p| p.local != Some(local_id) && p.ranges.total() > 0)
+        {
+            self.set_notice(id, "local file changed, restarted").await;
+        }
+        let resumable = prev.is_some_and(|p| p.local == Some(local_id));
         let (gate, rx, ack) = FtpGate::new();
         let local = local_path.to_path_buf();
         let remote = remote_path.to_string();
@@ -1931,18 +2726,20 @@ impl TransferManager {
                 gate,
                 pending: 0,
             };
-            // Mark the transfer resumable only once STOR/APPE is accepted: if
-            // the server refuses it, whatever already sits at `remote` is not
-            // ours and a retry must not append to it.
+            // Record the upload as resumable only once STOR/APPE is accepted:
+            // if the server refuses it, whatever already sits at `remote` is
+            // not ours and a retry must not append to it.
             stream.upload(&remote, start > 0, &mut reader, |r| r.gate.start(start))?;
             reader.finish()?;
             Ok(())
         });
-        let (res, (stop, done)) = tokio::join!(copy, self.ftp_pump(id, rx, ack));
+        let (res, (stop, done)) = tokio::join!(copy, self.ftp_pump(id, rx, ack, local_id));
         if let Some(e) = stop {
             return Err(e);
         }
-        res.map(|()| done)
+        res?;
+        self.forget_resume(id, false).await;
+        Ok(done)
     }
 
     /// Async half of an FTP copy: for each chunk the blocking side reports,
@@ -1954,6 +2751,7 @@ impl TransferManager {
         id: &str,
         mut rx: tokio::sync::mpsc::Receiver<FtpProgress>,
         ack: std::sync::mpsc::SyncSender<bool>,
+        local: LocalIdentity,
     ) -> (Option<anyhow::Error>, u64) {
         let mut done = 0u64;
         while let Some(msg) = rx.recv().await {
@@ -1962,10 +2760,16 @@ impl TransferManager {
                     // From here on the destination is this transfer's partial.
                     done = offset;
                     self.progress(id, offset);
-                    self.update(id, |t| {
-                        t.transferred = offset;
-                        t.resumable = true;
-                    })
+                    let mut iv = ranged::Intervals::default();
+                    iv.add(0, offset);
+                    self.store_resume(
+                        id,
+                        ResumeState {
+                            ranges: iv,
+                            local: Some(local),
+                            ..Default::default()
+                        },
+                    )
                     .await;
                     let _ = ack.send(true);
                 }
@@ -1982,174 +2786,6 @@ impl TransferManager {
         }
         self.update(id, |t| t.transferred = done).await;
         (None, done)
-    }
-
-    async fn run_object_download(
-        &self,
-        id: &str,
-        session: Arc<ObjectSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        use futures::StreamExt;
-        use tokio::io::AsyncWriteExt;
-
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        let key = remote_path.trim_start_matches('/');
-        let p = object_store::path::Path::from(key);
-        let get = session
-            .store
-            .get(&p)
-            .await
-            .with_context(|| format!("s3 get {key}"))?;
-
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        let mut stream = get.into_stream();
-        let mut transferred: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("s3 chunk for {key}"))?;
-            self.checkpoint(id, chunk.len() as u64).await?;
-            file.write_all(&chunk).await?;
-            transferred += chunk.len() as u64;
-            self.progress(id, transferred);
-        }
-        file.flush().await?;
-        self.update(id, |t| t.transferred = transferred).await;
-        Ok(transferred)
-    }
-
-    async fn run_object_upload(
-        &self,
-        id: &str,
-        session: Arc<ObjectSession>,
-        local_path: &Path,
-        remote_path: &str,
-    ) -> Result<u64> {
-        use tokio::io::AsyncReadExt;
-
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        let key = remote_path.trim_start_matches('/');
-        let p = object_store::path::Path::from(key);
-
-        // For files under ~16 MB we put in one shot; larger files go through
-        // a multipart upload so we get streaming + parallelism without buffering
-        // the whole body in memory.
-        let meta = tokio::fs::metadata(local_path)
-            .await
-            .with_context(|| format!("stat {}", local_path.display()))?;
-        let size = meta.len();
-        let mut file = tokio::fs::File::open(local_path)
-            .await
-            .with_context(|| format!("open {}", local_path.display()))?;
-
-        if size <= 16 * 1024 * 1024 {
-            self.checkpoint(id, size).await?;
-            let mut buf = Vec::with_capacity(size as usize);
-            file.read_to_end(&mut buf).await?;
-            session
-                .store
-                .put(&p, bytes::Bytes::from(buf).into())
-                .await
-                .with_context(|| format!("s3 put {key}"))?;
-            self.update(id, |t| t.transferred = size).await;
-            return Ok(size);
-        }
-
-        // Multipart path. object_store wants a `MultipartUpload` for which we
-        // push parts and call complete() at the end.
-        let upload = session
-            .store
-            .put_multipart(&p)
-            .await
-            .with_context(|| format!("s3 begin multipart {key}"))?;
-        // Aborted on any error or cancel (task abort drops the guard), so a
-        // failed upload never leaves billable orphaned parts behind.
-        let mut upload = MultipartGuard::new(upload, key.to_string());
-
-        const PART: usize = 8 * 1024 * 1024;
-        let mut transferred: u64 = 0;
-        let mut buf = vec![0u8; PART];
-        loop {
-            let mut filled = 0;
-            while filled < buf.len() {
-                let n = file.read(&mut buf[filled..]).await?;
-                if n == 0 {
-                    break;
-                }
-                filled += n;
-            }
-            if filled == 0 {
-                break;
-            }
-            self.checkpoint(id, filled as u64).await?;
-            let chunk = bytes::Bytes::copy_from_slice(&buf[..filled]);
-            upload
-                .get()
-                .put_part(chunk.into())
-                .await
-                .with_context(|| format!("s3 put_part {key}"))?;
-            transferred += filled as u64;
-            self.progress(id, transferred);
-            if filled < buf.len() {
-                break;
-            }
-        }
-        upload
-            .complete()
-            .await
-            .with_context(|| format!("s3 complete multipart {key}"))?;
-        self.update(id, |t| t.transferred = transferred).await;
-        Ok(transferred)
-    }
-
-    /// Stream a WebDAV download: a single ranged-capable `GET`, written to the
-    /// local file chunk by chunk so progress is real (not 0→size at the end).
-    async fn run_webdav_download(
-        &self,
-        id: &str,
-        session: Arc<WebdavSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        use futures::StreamExt;
-
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        let url = session.url_for(remote_path, false);
-        let resp = session
-            .request(reqwest::Method::GET, url)
-            .send()
-            .await
-            .with_context(|| format!("GET {remote_path}"))?;
-        if !resp.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "download {remote_path} failed: HTTP {}",
-                resp.status().as_u16()
-            ));
-        }
-
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        let mut stream = resp.bytes_stream();
-        let mut transferred: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("webdav chunk for {remote_path}"))?;
-            self.checkpoint(id, chunk.len() as u64).await?;
-            file.write_all(&chunk).await?;
-            transferred += chunk.len() as u64;
-            self.progress(id, transferred);
-        }
-        file.flush().await?;
-        self.update(id, |t| t.transferred = transferred).await;
-        Ok(transferred)
     }
 
     /// Upload via WebDAV `PUT`, streaming the file body straight off disk (no
@@ -2192,84 +2828,6 @@ impl TransferManager {
         }
         self.update(id, |t| t.transferred = size).await;
         Ok(size)
-    }
-
-    /// Stream a read-only HTTP download: a single `GET`, written chunk by chunk.
-    async fn run_http_download(
-        &self,
-        id: &str,
-        session: Arc<HttpSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        use futures::StreamExt;
-
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        let url = session.url_for(remote_path, false);
-        let resp = session
-            .request(reqwest::Method::GET, url)
-            .send()
-            .await
-            .with_context(|| format!("GET {remote_path}"))?;
-        if !resp.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "download {remote_path} failed: HTTP {}",
-                resp.status().as_u16()
-            ));
-        }
-
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        let mut stream = resp.bytes_stream();
-        let mut transferred: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("http chunk for {remote_path}"))?;
-            self.checkpoint(id, chunk.len() as u64).await?;
-            file.write_all(&chunk).await?;
-            transferred += chunk.len() as u64;
-            self.progress(id, transferred);
-        }
-        file.flush().await?;
-        self.update(id, |t| t.transferred = transferred).await;
-        Ok(transferred)
-    }
-
-    /// Stream a Dropbox download: POST `/2/files/download` (path in the
-    /// `Dropbox-API-Arg` header), written chunk by chunk.
-    async fn run_dropbox_download(
-        &self,
-        id: &str,
-        session: Arc<DropboxSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        use futures::StreamExt;
-
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        let dbx = crate::remotefs::dropbox::dropbox_api_path(remote_path);
-        let arg = serde_json::json!({ "path": dbx }).to_string();
-        let resp = session.content_get("/2/files/download", &arg).await?;
-
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        let mut stream = resp.bytes_stream();
-        let mut transferred: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("dropbox chunk for {remote_path}"))?;
-            self.checkpoint(id, chunk.len() as u64).await?;
-            file.write_all(&chunk).await?;
-            transferred += chunk.len() as u64;
-            self.progress(id, transferred);
-        }
-        file.flush().await?;
-        self.update(id, |t| t.transferred = transferred).await;
-        Ok(transferred)
     }
 
     /// Upload a file to Dropbox via `/2/files/upload` (overwrite mode). Simple
@@ -2343,36 +2901,6 @@ impl TransferManager {
         Ok(size)
     }
 
-    /// Download a Shopify theme asset. The Assets API answers with the whole
-    /// file as JSON (`value`/base64 `attachment`), so there is nothing to
-    /// stream — read it, write it out, report at completion like the FTP path.
-    async fn run_shopify_download(
-        &self,
-        id: &str,
-        session: Arc<ShopifySession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        self.checkpoint(id, 0).await?;
-        let data = crate::remotefs::shopify::read_asset(&session, remote_path).await?;
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        file.write_all(&data).await?;
-        file.flush().await?;
-        // The listing's size is advisory for these APIs; the body is the truth.
-        let n = data.len() as u64;
-        self.update(id, |t| {
-            t.size = n;
-            t.transferred = n;
-        })
-        .await;
-        Ok(n)
-    }
-
     /// Upload a file as a Shopify theme asset (create and update are the same
     /// PUT; theme files are small, so a single-shot write is the whole story).
     async fn run_shopify_upload(
@@ -2393,36 +2921,6 @@ impl TransferManager {
         crate::remotefs::shopify::write_asset(&session, remote_path, &data).await?;
         self.update(id, |t| t.transferred = size).await;
         Ok(size)
-    }
-
-    /// Download a HubSpot Design Manager file. The Source Code API answers
-    /// with the whole file as an octet-stream, so there is nothing to stream —
-    /// read it, write it out, report at completion like the Shopify path.
-    async fn run_hubspot_download(
-        &self,
-        id: &str,
-        session: Arc<HubSpotSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        self.checkpoint(id, 0).await?;
-        let data = crate::remotefs::hubspot::read_file(&session, remote_path).await?;
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        file.write_all(&data).await?;
-        file.flush().await?;
-        // The listing's size is advisory for these APIs; the body is the truth.
-        let n = data.len() as u64;
-        self.update(id, |t| {
-            t.size = n;
-            t.transferred = n;
-        })
-        .await;
-        Ok(n)
     }
 
     /// Upload a file to the HubSpot Design Manager (create and update are the
@@ -2448,36 +2946,6 @@ impl TransferManager {
         Ok(size)
     }
 
-    /// Download a Dataverse web resource. The Web API answers with the whole
-    /// file as base64 `content`, so there is nothing to stream — read it,
-    /// write it out, report at completion like the HubSpot path.
-    async fn run_dynamics_download(
-        &self,
-        id: &str,
-        session: Arc<DynamicsSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        self.checkpoint(id, 0).await?;
-        let data = crate::remotefs::dynamics::read_file(&session, remote_path).await?;
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        file.write_all(&data).await?;
-        file.flush().await?;
-        // The listing's size is advisory for these APIs; the body is the truth.
-        let n = data.len() as u64;
-        self.update(id, |t| {
-            t.size = n;
-            t.transferred = n;
-        })
-        .await;
-        Ok(n)
-    }
-
     /// Upload a file as a Dataverse web resource (create or update by name
     /// lookup, then publish — save = deployed).
     async fn run_dynamics_upload(
@@ -2498,40 +2966,6 @@ impl TransferManager {
         crate::remotefs::dynamics::write_file(&session, remote_path, &data).await?;
         self.update(id, |t| t.transferred = size).await;
         Ok(size)
-    }
-
-    /// Stream a OneDrive download: GET the item's `/content` (Graph 302s to a
-    /// pre-authorized URL, which reqwest follows), written chunk by chunk.
-    async fn run_onedrive_download(
-        &self,
-        id: &str,
-        session: Arc<OneDriveSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        use futures::StreamExt;
-
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        let content = crate::remotefs::onedrive::content_ref(remote_path);
-        let resp = session.get_stream(&content).await?;
-
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        let mut stream = resp.bytes_stream();
-        let mut transferred: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("onedrive chunk for {remote_path}"))?;
-            self.checkpoint(id, chunk.len() as u64).await?;
-            file.write_all(&chunk).await?;
-            transferred += chunk.len() as u64;
-            self.progress(id, transferred);
-        }
-        file.flush().await?;
-        self.update(id, |t| t.transferred = transferred).await;
-        Ok(transferred)
     }
 
     /// Upload to OneDrive: a single `PUT …/content` for small files, or a
@@ -2674,45 +3108,6 @@ impl TransferManager {
         Ok(())
     }
 
-    /// Stream a Google Drive download: resolve the path to a file id, then GET
-    /// `/files/{id}?alt=media`.
-    async fn run_gdrive_download(
-        &self,
-        id: &str,
-        session: Arc<GDriveSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        use futures::StreamExt;
-
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        let (file_id, _) = session
-            .resolve_item(remote_path)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("{remote_path}: not found"))?;
-        let resp = session
-            .get_stream(&format!("/files/{file_id}?alt=media"))
-            .await?;
-
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        let mut stream = resp.bytes_stream();
-        let mut transferred: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("drive chunk for {remote_path}"))?;
-            self.checkpoint(id, chunk.len() as u64).await?;
-            file.write_all(&chunk).await?;
-            transferred += chunk.len() as u64;
-            self.progress(id, transferred);
-        }
-        file.flush().await?;
-        self.update(id, |t| t.transferred = transferred).await;
-        Ok(transferred)
-    }
-
     /// Upload to Google Drive: update the existing file's media if a same-named
     /// child exists, else create a new file via a multipart/related request.
     async fn run_gdrive_upload(
@@ -2792,44 +3187,6 @@ impl TransferManager {
         session.clear_cache();
         self.update(id, |t| t.transferred = size).await;
         Ok(size)
-    }
-
-    /// Stream a Box download: resolve the path to a file id, GET `/files/{id}/content`.
-    async fn run_box_download(
-        &self,
-        id: &str,
-        session: Arc<BoxSession>,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<u64> {
-        use futures::StreamExt;
-
-        self.update(id, |t| t.status = TransferStatus::Transferring)
-            .await;
-
-        let (file_id, _) = session
-            .resolve_item(remote_path)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("{remote_path}: not found"))?;
-        let resp = session
-            .get_stream(&format!("/files/{file_id}/content"))
-            .await?;
-
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .with_context(|| format!("create {}", local_path.display()))?;
-        let mut stream = resp.bytes_stream();
-        let mut transferred: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("box chunk for {remote_path}"))?;
-            self.checkpoint(id, chunk.len() as u64).await?;
-            file.write_all(&chunk).await?;
-            transferred += chunk.len() as u64;
-            self.progress(id, transferred);
-        }
-        file.flush().await?;
-        self.update(id, |t| t.transferred = transferred).await;
-        Ok(transferred)
     }
 
     /// Upload to Box via multipart/form-data: a new file (`/files/content` with
@@ -3321,27 +3678,20 @@ fn split_ext(path: &str) -> (&str, &str) {
     }
 }
 
-/// Transient = worth an auto-retry (Plan 12's structured error kinds):
-/// network and timeout failures; auth/permission/not-found never retry.
-fn is_transient(e: &anyhow::Error) -> bool {
-    matches!(
-        crate::error::classify_message(&format!("{e:#}")),
-        crate::error::ErrorKind::Network | crate::error::ErrorKind::Timeout
-    )
-}
-
 /// Shared runner (Plan 17, Plan 24): admission → attempt loop → finalize →
 /// wake the queue. A pause gives the concurrency slot back and re-enters
-/// admission (Plan 24 Phase 1); transient errors auto-retry with 5s/20s
-/// backoff while keeping the slot.
+/// admission (Phase 1); the next run resumes from what is on disk (Phase 4).
+/// Retryable errors back off with full jitter on a budget that refills
+/// whenever bytes moved since the last failure (Phase 5). Downloads retry
+/// each range inside the engine, so what reaches here is mostly setup
+/// trouble (connecting, stat).
 async fn run_job(mgr: Arc<TransferManager>, id: String, job: RetryInfo) {
-    let mut auto_retries = 0u32;
+    let mut budget = retry::Budget::new();
     let res = 'admit: loop {
         let Some(permit) = mgr.admit(&id).await else {
             return;
         };
         loop {
-            // A fresh run counts from its start offset (0 until resume).
             {
                 let live = mgr.live(&id);
                 live.set(0);
@@ -3351,8 +3701,9 @@ async fn run_job(mgr: Arc<TransferManager>, id: String, job: RetryInfo) {
                 RetryInfo::Download {
                     session,
                     remote_path,
-                    final_path,
-                } => dispatch_download(&mgr, &id, session, remote_path, final_path).await,
+                    target,
+                    policy,
+                } => mgr.run_download(&id, session, remote_path, target, *policy).await,
                 RetryInfo::Upload {
                     session,
                     local,
@@ -3361,103 +3712,48 @@ async fn run_job(mgr: Arc<TransferManager>, id: String, job: RetryInfo) {
                 #[cfg(test)]
                 RetryInfo::Test(f) => f(Arc::clone(&mgr), id.clone()).await,
             };
-            match attempt {
-                Err(e) if is_paused(&e) => {
-                    drop(permit);
-                    mgr.requeue_paused(&id).await;
-                    continue 'admit;
-                }
-                Err(e) if auto_retries < MAX_AUTO_RETRIES && is_transient(&e) => {
-                    auto_retries += 1;
-                    let delay = if auto_retries == 1 { 5 } else { 20 };
-                    mgr.update(&id, |t| {
-                        t.transferred = 0;
-                        t.retry_attempt = Some(auto_retries);
-                        t.error = Some(format!(
-                            "retrying in {delay}s (attempt {}/3)",
-                            auto_retries + 1
-                        ));
-                    })
-                    .await;
-                    if let Some(t) = mgr.get(&id).await {
-                        mgr.emit("transfer://updated", &t);
-                    }
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    mgr.update(&id, |t| t.error = None).await;
-                    continue;
-                }
-                other => break 'admit other,
+            let err = match attempt {
+                Ok(n) => break 'admit Ok(n),
+                Err(e) => e,
+            };
+            if is_paused(&err) {
+                drop(permit);
+                mgr.requeue_paused(&id).await;
+                continue 'admit;
             }
+            if retry::classify(&err) == retry::Verdict::Fatal {
+                break 'admit Err(err);
+            }
+            let server_wait = retry::retry_after(&err);
+            let attempt_no = match server_wait {
+                Some(_) => Some(budget.attempts().max(1)),
+                None => budget.fail(mgr.live(&id).get()),
+            };
+            let Some(attempt_no) = attempt_no else {
+                break 'admit Err(err);
+            };
+            let delay = server_wait.unwrap_or_else(|| retry::backoff(attempt_no));
+            tracing::warn!("transfer {id} failed (attempt {attempt_no}), retrying in {delay:?}: {err:#}");
+            let secs = delay.as_secs_f64().ceil() as u64;
+            mgr.update(&id, |t| {
+                t.retry_attempt = Some(attempt_no);
+                t.error = Some(format!(
+                    "retrying in {secs}s (attempt {}/{})",
+                    attempt_no + 1,
+                    retry::MAX_ATTEMPTS + 1
+                ));
+                t.settle();
+            })
+            .await;
+            if let Some(t) = mgr.get(&id).await {
+                mgr.emit("transfer://updated", &t);
+            }
+            tokio::time::sleep(delay).await;
+            mgr.update(&id, |t| t.error = None).await;
         }
     };
     finalize(&mgr, &id, res).await;
     mgr.bump_queue_quiet().await;
-}
-
-/// Backend dispatch for a single-file download. Extracted so the runner (and
-/// Phase 3 retry) can re-invoke it.
-async fn dispatch_download(
-    mgr: &Arc<TransferManager>,
-    id: &str,
-    session: &Arc<Session>,
-    remote_path: &str,
-    final_path: &Path,
-) -> Result<u64> {
-    match &**session {
-        Session::Ssh(ssh) => {
-            mgr.run_ssh_download(id, ssh.clone(), remote_path, final_path)
-                .await
-        }
-        Session::Ftp(ftp) => {
-            mgr.run_ftp_download(id, ftp.clone(), remote_path, final_path)
-                .await
-        }
-        Session::Object(obj) => {
-            mgr.run_object_download(id, obj.clone(), remote_path, final_path)
-                .await
-        }
-        Session::Webdav(dav) => {
-            mgr.run_webdav_download(id, dav.clone(), remote_path, final_path)
-                .await
-        }
-        Session::Http(http) => {
-            mgr.run_http_download(id, http.clone(), remote_path, final_path)
-                .await
-        }
-        Session::Dropbox(dbx) => {
-            mgr.run_dropbox_download(id, dbx.clone(), remote_path, final_path)
-                .await
-        }
-        Session::OneDrive(od) => {
-            mgr.run_onedrive_download(id, od.clone(), remote_path, final_path)
-                .await
-        }
-        Session::GDrive(gd) => {
-            mgr.run_gdrive_download(id, gd.clone(), remote_path, final_path)
-                .await
-        }
-        Session::Box(bx) => {
-            mgr.run_box_download(id, bx.clone(), remote_path, final_path)
-                .await
-        }
-        Session::Shopify(sh) => {
-            mgr.run_shopify_download(id, sh.clone(), remote_path, final_path)
-                .await
-        }
-        Session::HubSpot(hs) => {
-            mgr.run_hubspot_download(id, hs.clone(), remote_path, final_path)
-                .await
-        }
-        Session::Dynamics(dynm) => {
-            mgr.run_dynamics_download(id, dynm.clone(), remote_path, final_path)
-                .await
-        }
-        Session::Agent(agent) => {
-            debug_assert!(supports_delta(session));
-            mgr.run_agent_download_with_delta(id, agent.clone(), remote_path, final_path)
-                .await
-        }
-    }
 }
 
 /// Backend dispatch for a single-file upload.
@@ -3542,6 +3838,7 @@ async fn finalize(mgr: &Arc<TransferManager>, id: &str, result: Result<u64>) {
         }
         Err(e) => Err(e),
     };
+    let skipped = matches!(&result, Err(e) if e.is::<SkippedAtPlace>());
     match result {
         Ok(written) => {
             mgr.update(id, |t| {
@@ -3557,10 +3854,23 @@ async fn finalize(mgr: &Arc<TransferManager>, id: &str, result: Result<u64>) {
                 mgr.emit("transfer://done", &t);
             }
         }
+        Err(_) if skipped => {
+            mgr.update(id, |t| {
+                t.status = TransferStatus::Skipped;
+                t.settle();
+                t.error = None;
+                t.retry_attempt = None;
+            })
+            .await;
+            if let Some(t) = mgr.get(id).await {
+                mgr.emit("transfer://done", &t);
+            }
+        }
         Err(e) => {
             mgr.update(id, |t| {
                 t.status = TransferStatus::Error;
                 t.settle();
+                t.retry_attempt = None;
                 t.error = Some(e.to_string());
             })
             .await;
@@ -3651,7 +3961,7 @@ mod tests {
             segments: None,
             stalled: false,
             notice: None,
-            resumable: false,
+            restored: false,
         })
         .await;
         mgr.pauses.lock().await.insert(id.into(), PauseGate::new());
@@ -3756,7 +4066,7 @@ mod tests {
                 segments: None,
                 stalled: false,
                 notice: None,
-                resumable: false,
+                restored: false,
             })
             .await;
         }
@@ -3818,17 +4128,6 @@ mod tests {
     }
 
     // ---------- Retry classification (Phase 3) ----------
-
-    #[test]
-    fn transient_errors_retry_permanent_ones_dont() {
-        assert!(is_transient(&anyhow::anyhow!("connection reset by peer")));
-        assert!(is_transient(&anyhow::anyhow!("operation timed out")));
-        assert!(!is_transient(&anyhow::anyhow!("authentication failed")));
-        assert!(!is_transient(&anyhow::anyhow!(
-            "Permission denied (os error 13)"
-        )));
-        assert!(!is_transient(&anyhow::anyhow!("No such file or directory")));
-    }
 
     #[test]
     fn remote_join_follows_the_destination_style() {
@@ -3952,8 +4251,8 @@ mod tests {
         source: &str,
         destination: &str,
         size: u64,
-    ) -> TransferManager {
-        let mgr = TransferManager::new();
+    ) -> Arc<TransferManager> {
+        let mgr = Arc::new(TransferManager::new());
         mgr.insert(Transfer {
             id: id.to_string(),
             kind,
@@ -3971,7 +4270,7 @@ mod tests {
             segments: None,
             stalled: false,
             notice: None,
-            resumable: false,
+            restored: false,
         })
         .await;
         mgr
@@ -4243,6 +4542,205 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&local).unwrap(), std::fs::read(&remote).unwrap());
         assert!(mgr.get("d").await.unwrap().delta.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- Download pipeline + resume (Plan 24 Phases 2–4) ----------
+
+    /// An object-store session over object_store's in-memory backend, which
+    /// serves ranged GETs and honours `if_match` like a real store.
+    fn memory_session(store: Arc<object_store::memory::InMemory>) -> Arc<Session> {
+        Arc::new(Session::Object(Arc::new(crate::session::ObjectSession {
+            id: "mem".into(),
+            profile: delta_gate_profile("s3"),
+            container: "b".into(),
+            store,
+        })))
+    }
+
+    async fn put_object(store: &object_store::memory::InMemory, key: &str, data: &[u8]) {
+        use object_store::ObjectStore;
+        store
+            .put(&object_store::path::Path::from(key), bytes::Bytes::copy_from_slice(data).into())
+            .await
+            .unwrap();
+    }
+
+    /// Register a queued download the way `start_download` does.
+    async fn queue_download(
+        mgr: &Arc<TransferManager>,
+        id: &str,
+        session: &Arc<Session>,
+        key: &str,
+        target: &Path,
+        size: u64,
+    ) -> RetryInfo {
+        mgr.insert(Transfer {
+            id: id.into(),
+            kind: TransferKind::Download,
+            source: key.into(),
+            destination: target.to_string_lossy().into_owned(),
+            size,
+            transferred: 0,
+            status: TransferStatus::Queued,
+            error: None,
+            retry_attempt: None,
+            delta: None,
+            started_at: 0,
+            bytes_per_sec: None,
+            eta_secs: None,
+            segments: None,
+            stalled: false,
+            notice: None,
+            restored: false,
+        })
+        .await;
+        let job = RetryInfo::Download {
+            session: Arc::clone(session),
+            remote_path: key.into(),
+            target: target.to_path_buf(),
+            policy: OverwritePolicy::Overwrite,
+        };
+        mgr.retry.lock().await.insert(id.into(), job.clone());
+        mgr.pauses.lock().await.insert(id.into(), PauseGate::new());
+        mgr.waiting.lock().await.push_back(id.into());
+        job
+    }
+
+    async fn wait_status(mgr: &Arc<TransferManager>, id: &str, want: TransferStatus) {
+        for _ in 0..2000 {
+            if mgr.get(id).await.map(|t| t.status) == Some(want) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{id} never reached {want:?}: {:?}", mgr.get(id).await);
+    }
+
+    #[tokio::test]
+    async fn download_lands_via_part_file_and_keeps_the_original_until_done() {
+        let dir = test_dirs("pipe");
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let data = det_bytes(0x51, 20 * 1024 * 1024 + 5);
+        put_object(&store, "f.bin", &data).await;
+        let session = memory_session(store);
+        let target = dir.join("local/f.bin");
+        std::fs::write(&target, b"the old file").unwrap();
+
+        let mgr = Arc::new(TransferManager::new());
+        let job = queue_download(&mgr, "d", &session, "f.bin", &target, data.len() as u64).await;
+        run_job(Arc::clone(&mgr), "d".into(), job).await;
+        let t = mgr.get("d").await.unwrap();
+        assert_eq!(t.status, TransferStatus::Done, "{:?}", t.error);
+        assert_eq!(std::fs::read(&target).unwrap(), data);
+        assert!(!partfile::part_path_for(&target).exists());
+        assert!(mgr.resume_state("d").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pause at ~40 %, "restart the app" (a fresh manager on the same
+    /// faro.db), resume: the run continues from the saved ranges and the
+    /// result is byte-identical. Then the same with a remote that changed in
+    /// between: it restarts from 0 with a notice and never stitches.
+    #[tokio::test]
+    async fn resume_survives_a_restart_and_rejects_a_changed_remote() {
+        let dir = test_dirs("resume");
+        let db = Arc::new(crate::db::Db::open_in_memory().unwrap());
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let data = det_bytes(0x52, 24 * 1024 * 1024);
+        put_object(&store, "big.bin", &data).await;
+        let session = memory_session(Arc::clone(&store));
+        let target = dir.join("local/big.bin");
+        let size = data.len() as u64;
+
+        for changed in [false, true] {
+            let _ = std::fs::remove_file(&target);
+            let mgr = Arc::new(TransferManager::new());
+            mgr.set_db(Arc::clone(&db));
+            mgr.set_throttle_kbps(16 * 1024);
+            let job = queue_download(&mgr, "r", &session, "big.bin", &target, size).await;
+            let task = tokio::spawn(run_job(Arc::clone(&mgr), "r".into(), job));
+            while mgr.live("r").get() < size * 2 / 5 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            mgr.pauses.lock().await.get("r").unwrap().set(true);
+            wait_status(&mgr, "r", TransferStatus::Paused).await;
+            let saved = mgr.resume_state("r").unwrap().ranges.total();
+            assert!(saved >= size / 4, "saved {saved}");
+            assert!(partfile::part_path_for(&target).exists(), "pause keeps the temp");
+            task.abort(); // the app quits
+
+            let expect = if changed {
+                let fresh = det_bytes(0x53, size as usize);
+                put_object(&store, "big.bin", &fresh).await;
+                fresh
+            } else {
+                data.clone()
+            };
+
+            // Relaunch: the row comes back Paused, restored, at its progress.
+            let mgr = Arc::new(TransferManager::new());
+            mgr.set_db(Arc::clone(&db));
+            mgr.restore().await;
+            let t = mgr.get("r").await.unwrap();
+            assert_eq!((t.status, t.restored), (TransferStatus::Paused, true));
+            assert_eq!(t.transferred, saved);
+            assert_eq!(mgr.restored_connection("r").await.as_deref(), Some("t"));
+
+            mgr.requeue_restored("r", Arc::clone(&session)).await.unwrap();
+            let mut first = None;
+            loop {
+                let b = mgr.live("r").get();
+                if first.is_none() && b > 0 {
+                    first = Some(b);
+                }
+                if mgr.get("r").await.unwrap().status == TransferStatus::Done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let t = mgr.get("r").await.unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), expect, "changed={changed}");
+            if changed {
+                assert_eq!(t.notice.as_deref(), Some("remote changed, restarted"));
+            } else {
+                assert!(first.unwrap() >= saved, "resumed from {first:?}, saved {saved}");
+                assert!(t.notice.is_none());
+            }
+            assert!(db.resume_list().unwrap().is_empty(), "Done clears the record");
+            assert!(!partfile::part_path_for(&target).exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancel discards the temp and the record; an error keeps both.
+    #[tokio::test]
+    async fn cancel_discards_the_partial_download() {
+        let dir = test_dirs("cancel");
+        let db = Arc::new(crate::db::Db::open_in_memory().unwrap());
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let data = det_bytes(0x54, 8 * 1024 * 1024);
+        put_object(&store, "c.bin", &data).await;
+        let session = memory_session(store);
+        let target = dir.join("local/c.bin");
+        let mgr = Arc::new(TransferManager::new());
+        mgr.set_db(Arc::clone(&db));
+        mgr.set_throttle_kbps(2 * 1024);
+        let job = queue_download(&mgr, "c", &session, "c.bin", &target, data.len() as u64).await;
+        let task = tokio::spawn(run_job(Arc::clone(&mgr), "c".into(), job));
+        mgr.tasks.lock().await.insert("c".into(), task);
+        while mgr.live("c").get() < 1024 * 1024 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(db.resume_list().unwrap().len(), 1);
+        // `cancel` needs an AppHandle only to bind it; do its work directly.
+        if let Some(h) = mgr.tasks.lock().await.remove("c") {
+            h.abort();
+        }
+        mgr.forget_resume("c", true).await;
+        assert!(db.resume_list().unwrap().is_empty());
+        assert!(!partfile::part_path_for(&target).exists());
+        assert!(!target.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

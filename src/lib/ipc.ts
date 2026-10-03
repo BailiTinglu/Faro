@@ -272,6 +272,13 @@ export const ipc = {
   transferSetDeltaSync: (enabled: boolean) =>
     invoke<void>("transfer_set_delta_sync", { enabled }),
 
+  /** Max parallel ranges/parts per file; 0 = auto (Plan 24). */
+  transferSetSegments: (count: number) =>
+    invoke<void>("transfer_set_segments", { count }),
+
+  transferSetVerify: (enabled: boolean) =>
+    invoke<void>("transfer_set_verify", { enabled }),
+
   transferQueueState: () => invoke<TransferQueueState>("transfer_queue_state"),
 
   startDirectoryDownload: (
