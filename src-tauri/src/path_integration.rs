@@ -21,6 +21,7 @@
 //! Removal only ever touches Faro's own entry/symlink/marker — never anything
 //! else in the user's environment.
 
+use crate::proc::NoConsoleWindow;
 use serde::Serialize;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
@@ -126,6 +127,7 @@ fn which_faro_cli() -> Option<PathBuf> {
     let finder = if cfg!(windows) { "where" } else { "which" };
     let out = std::process::Command::new(finder)
         .arg("faro-cli")
+        .no_console_window()
         .output()
         .ok()?;
     if !out.status.success() {

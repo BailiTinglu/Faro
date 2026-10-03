@@ -49,6 +49,7 @@ export function useCommands(): Command[] {
   const activeProfileId = useConnections((s) => s.activeProfileId);
   const connect = useConnections((s) => s.connect);
   const disconnect = useConnections((s) => s.disconnect);
+  const reconnect = useConnections((s) => s.reconnect);
 
   const togglePanel = useTransfers((s) => s.togglePanel);
 
@@ -238,6 +239,13 @@ export function useCommands(): Command[] {
       group: "Connection",
       icon: <Unplug size={14} />,
       run: () => disconnect(),
+    });
+    cmds.push({
+      id: "reconnect",
+      title: "Reconnect",
+      group: "Connection",
+      icon: <RefreshCw size={14} />,
+      run: () => reconnect().catch(() => {}),
     });
   }
 

@@ -4,6 +4,7 @@
 // stays a plain string (emoji char or "prefix:name"), so the rail, the mock
 // layer, and the backend need no changes.
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ChevronDown, Search, X } from "lucide-react";
 import { BrandIcon } from "@/lib/brandIcons";
 import { BRAND_ICONS } from "@/lib/brandIconData";
@@ -122,7 +123,11 @@ export function IconPicker({
         <ChevronDown size={13} className="shrink-0 text-text-dim" />
       </button>
 
-      {open && pos && (
+      {/* Portaled to <body>: the picker sits inside the editor's <label>, and a
+          popover nested in it turns every click into a label activation that
+          re-clicks the trigger (WebKitGTK reopens it at once). Outside the
+          dialog panel, Escape here also no longer closes the whole editor. */}
+      {open && pos && createPortal(
         <div className="fixed inset-0 z-palette" onClick={() => setOpen(false)}>
           <div
             role="dialog"
@@ -219,7 +224,8 @@ export function IconPicker({
               )}
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </>
   );

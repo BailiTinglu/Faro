@@ -172,22 +172,27 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
   const [port, setPort] = useState(seed?.port ?? defaultPort);
   const [portTouched, setPortTouched] = useState<boolean>(!!seed?.port);
   const [username, setUsername] = useState(seed?.username ?? "");
+  // A duplicate's prefill carries the source's auth so only what differs needs
+  // retyping. A keychain-held key (keyref) is tied to the source's id and can't
+  // be copied, so a duplicate of one starts blank.
+  const seedAuth =
+    profile?.auth ?? (seed?.auth?.kind === "keyref" ? undefined : seed?.auth);
   const [authKind, setAuthKind] = useState<AuthMethod["kind"]>(
-    profile?.auth.kind ?? "password"
+    seedAuth?.kind ?? "password"
   );
   const [password, setPassword] = useState(
-    profile?.auth.kind === "password" ? profile.auth.password : ""
+    seedAuth?.kind === "password" ? seedAuth.password : ""
   );
   const [keyPath, setKeyPath] = useState(
-    profile?.auth.kind === "key" ? profile.auth.path : ""
+    seedAuth?.kind === "key" ? seedAuth.path : ""
   );
   const [passphrase, setPassphrase] = useState(
-    profile?.auth.kind === "key" ? profile.auth.passphrase ?? "" : ""
+    seedAuth?.kind === "key" ? seedAuth.passphrase ?? "" : ""
   );
   const [defaultRemotePath, setDefaultRemotePath] = useState(
     seed?.defaultRemotePath ?? "."
   );
-  const [autoConnect, setAutoConnect] = useState(profile?.autoConnect ?? false);
+  const [autoConnect, setAutoConnect] = useState(seed?.autoConnect ?? false);
   // FTP-only: path-name character set ("" = auto).
   const [ftpEncoding, setFtpEncoding] = useState(seed?.ftpEncoding ?? "");
   const [ftpActiveMode, setFtpActiveMode] = useState(seed?.ftpActiveMode ?? false);
@@ -441,7 +446,7 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
           ? { kind: "password", password: "" }
           : auth,
       defaultRemotePath: defaultRemotePath || undefined,
-      color: profile?.color,
+      color: seed?.color,
       autoConnect: autoConnect || undefined,
       bucket: isObject ? bucket : undefined,
       region: isS3 ? region : undefined,
@@ -644,7 +649,7 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
               className={inputCls}
             />
           </Field>
-          <Field label="Icon (optional)" className="w-40">
+          <Field group label="Icon (optional)" className="w-40">
             <IconPicker
               value={icon}
               onChange={setIcon}
@@ -1265,7 +1270,7 @@ function KeyAuthSection({
             Generate a new SSH key
           </div>
 
-          <Field label="Type">
+          <Field group label="Type">
             <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-bg-panel p-1">
               {(
                 [
@@ -1903,7 +1908,7 @@ function WebdavSection({
 
   return (
     <>
-      <Field label="Provider">
+      <Field group label="Provider">
         <div className="grid grid-cols-4 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(Object.keys(WEBDAV_PROVIDER_PRESETS) as WebdavProvider[]).map((p) => {
             const data = WEBDAV_PROVIDER_PRESETS[p];
@@ -1952,7 +1957,7 @@ function WebdavSection({
         />
       </Field>
 
-      <Field label="Auth">
+      <Field group label="Auth">
         <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(["basic", "bearer"] as const).map((m) => (
             <button
@@ -2034,7 +2039,7 @@ function ShopifySection({
         unpublished/duplicate theme — changes deploy instantly.
       </Hint>
 
-      <Field label="Auth">
+      <Field group label="Auth">
         <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(["token", "client"] as const).map((m) => (
             <button
@@ -2180,7 +2185,7 @@ function DynamicsSection({
         Edits publish immediately — prefer a dev/sandbox environment.
       </Hint>
 
-      <Field label="Auth">
+      <Field group label="Auth">
         <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(["client", "delegated"] as const).map((m) => (
             <button
@@ -2281,7 +2286,7 @@ function GcsSection({
         />
       </Field>
 
-      <Field label="Service account key">
+      <Field group label="Service account key">
         <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(["file", "paste"] as const).map((m) => (
             <button
@@ -2356,7 +2361,7 @@ function S3Section({
   const preset = S3_PROVIDER_PRESETS[provider];
   return (
     <>
-      <Field label="Provider">
+      <Field group label="Provider">
         <div className="grid grid-cols-3 gap-1 rounded-md border border-border bg-bg-subtle p-1">
           {(Object.keys(S3_PROVIDER_PRESETS) as S3Provider[]).map((p) => {
             const data = S3_PROVIDER_PRESETS[p];
@@ -2574,17 +2579,22 @@ const inputCls =
 function Field({
   label,
   className,
+  group,
   children,
 }: {
   label: string;
   className?: string;
+  /** Wraps buttons, not one input: render a <div>, since a <label> turns any
+   *  click on its caption or padding into a click on its first button. */
+  group?: boolean;
   children: React.ReactNode;
 }) {
+  const Tag = group ? "div" : "label";
   return (
-    <label className={`mb-3 block ${className ?? ""}`}>
+    <Tag className={`mb-3 block ${className ?? ""}`}>
       <div className="mb-1 text-xs text-text-muted">{label}</div>
       {children}
-    </label>
+    </Tag>
   );
 }
 

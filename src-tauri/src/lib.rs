@@ -26,6 +26,7 @@ mod known_hosts;
 pub mod oauth;
 mod path_integration;
 mod preview;
+mod proc;
 pub mod profiles;
 pub mod remotefs;
 pub mod scan;

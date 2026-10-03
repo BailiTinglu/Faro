@@ -10,6 +10,7 @@
 //! like `agent_host.rs`: load / persist / auto_start_if_enabled / status, JSON
 //! config under the app data dir, `"cli-updater://status"` events via `Emitter`.
 
+use crate::proc::NoConsoleWindow;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -162,7 +163,10 @@ impl CliUpdater {
 
 /// Run `faro-cli --version` and pull the `X.Y.Z` out of `faro-cli X.Y.Z`.
 fn read_cli_version(path: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new(path).arg("--version").output().ok()?;
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .no_console_window()
+        .output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -185,7 +189,10 @@ fn locate_cli() -> Option<PathBuf> {
     }
     // 2) On PATH.
     let finder = if cfg!(windows) { "where" } else { "which" };
-    let out = std::process::Command::new(finder).arg("faro-cli").output().ok()?;
+    let out = std::process::Command::new(finder)
+        .arg("faro-cli")
+        .no_console_window()
+        .output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -200,6 +207,7 @@ fn locate_cli() -> Option<PathBuf> {
 async fn run_self_update(path: &std::path::Path) -> Result<String, String> {
     let out = tokio::process::Command::new(path)
         .arg("self-update")
+        .no_console_window()
         .output()
         .await
         .map_err(|e| format!("run {} self-update: {e}", path.display()))?;

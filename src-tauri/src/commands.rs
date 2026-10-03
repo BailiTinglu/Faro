@@ -1,3 +1,4 @@
+use crate::proc::NoConsoleWindow;
 use crate::error::{ErrorKind, FaroError};
 use crate::profiles::{AuthMethod, ConnectionProfile};
 use crate::remotefs::{Capabilities, DirEntry, RemoteFs};
@@ -1910,6 +1911,7 @@ pub async fn bridge_register_mcp(url: String, token: String) -> Result<String, S
     for bin in candidates {
         let output = std::process::Command::new(bin)
             .args(&args)
+            .no_console_window()
             .output()
             .map_err(|e| format!("couldn't run {bin}: {e}"))?;
         if output.status.success() {

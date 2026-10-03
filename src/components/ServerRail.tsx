@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Plus,
   Download,
@@ -9,6 +10,8 @@ import {
   TerminalSquare,
   Pencil,
   Trash2,
+  Copy,
+  RefreshCw,
   Power,
   Shield,
   X,
@@ -85,6 +88,7 @@ export function ServerRail() {
     loadProfiles,
     connect,
     disconnect,
+    reconnect,
     deleteProfile,
     setActiveSession,
     saveProfile,
@@ -93,6 +97,7 @@ export function ServerRail() {
   } = useConnections();
   const setTerminalOpen = useLayout((s) => s.setTerminalOpen);
   const openDialog = useLayout((s) => s.openDialog);
+  const openNewConnection = useLayout((s) => s.openNewConnection);
   const browseLocal = useLayout((s) => s.browseLocal);
   const setBrowseLocal = useLayout((s) => s.setBrowseLocal);
   const browserLayout = useSettings((s) => s.browserLayout);
@@ -112,6 +117,7 @@ export function ServerRail() {
   const [editing, setEditing] = useState<ConnectionProfile | "new" | null>(null);
   const [importing, setImporting] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const searchToggleRef = useRef<HTMLDivElement>(null);
   // Which profile we last asked to connect — localizes the global
   // connecting/error flags onto the owning bubble (mirrors ConnectionManager).
   const [pendingId, setPendingId] = useState<string | null>(null);
@@ -426,6 +432,28 @@ export function ServerRail() {
       label: "Properties / Edit…",
       icon: <Pencil size={14} />,
       onClick: () => setEditing(p),
+    });
+    // Duplicate opens the New Connection editor seeded from this profile, so a
+    // sibling login (same host, different user/password) is a quick edit.
+    items.push({
+      label: "Duplicate…",
+      icon: <Copy size={14} />,
+      onClick: () => {
+        const { id: _id, sortOrder: _so, ...rest } = p;
+        const oauthAccount =
+          p.protocol === "dropbox" ||
+          p.protocol === "onedrive" ||
+          p.protocol === "gdrive" ||
+          p.protocol === "box" ||
+          p.protocol === "dynamics";
+        openNewConnection({
+          ...rest,
+          name: `${p.name} (copy)`,
+          autoConnect: undefined,
+          // OAuth tokens are keyed by profile id — the copy must sign in anew.
+          account: oauthAccount ? undefined : p.account,
+        });
+      },
       separatorAfter: true,
     });
     // Group membership: one flat item per existing group, plus "New group…".
@@ -464,6 +492,16 @@ export function ServerRail() {
       onClick: () => saveProfile({ ...p, autoConnect: !p.autoConnect }),
     });
     if (connected && sid) {
+      items.push({
+        label: "Reconnect",
+        icon: <RefreshCw size={14} />,
+        onClick: () => {
+          setPendingId(p.id);
+          reconnect(sid)
+            .then(() => setPendingId((cur) => (cur === p.id ? null : cur)))
+            .catch(() => {});
+        },
+      });
       items.push({
         label: "Disconnect",
         icon: <Unplug size={14} />,
@@ -807,14 +845,16 @@ export function ServerRail() {
 
       {/* Pinned controls */}
       <div className="relative flex flex-col items-center gap-1 border-t border-border py-2">
-        <RailIconButton
-          expanded={expanded}
-          label="Search servers  ·  /"
-          active={searchOpen}
-          onClick={() => setSearchOpen((v) => !v)}
-        >
-          <Search size={17} />
-        </RailIconButton>
+        <div ref={searchToggleRef} className="contents">
+          <RailIconButton
+            expanded={expanded}
+            label="Search servers  ·  /"
+            active={searchOpen}
+            onClick={() => setSearchOpen((v) => !v)}
+          >
+            <Search size={17} />
+          </RailIconButton>
+        </div>
         <RailIconButton
           expanded={expanded}
           label="New connection"
@@ -844,10 +884,15 @@ export function ServerRail() {
             connectedIds={connectedIds}
             onPick={pickFromSearch}
             onClose={() => setSearchOpen(false)}
+            toggleRef={searchToggleRef}
           />
         )}
       </div>
 
+      {/* Portaled: the rail's z-dropdown layer is a stacking context, which would
+          otherwise cap these dialogs at z-30 instead of their own z-modal/menu. */}
+      {createPortal(
+        <>
       {menu && (
         <ContextMenu
           x={menu.x}
@@ -885,6 +930,9 @@ export function ServerRail() {
           onClose={() => setPendingDelete(null)}
           onConfirm={() => deleteProfile(pendingDelete.id)}
         />
+      )}
+        </>,
+        document.body
       )}
       </div>
     </div>
@@ -1438,11 +1486,15 @@ function RailSearch({
   connectedIds,
   onPick,
   onClose,
+  toggleRef,
 }: {
   profiles: ConnectionProfile[];
   connectedIds: Set<string>;
   onPick: (p: ConnectionProfile) => void;
   onClose: () => void;
+  /** The button that toggles search: its own click closes it, so an outside
+   *  mousedown there must not close first (the click would just reopen it). */
+  toggleRef: React.RefObject<HTMLElement>;
 }) {
   const [query, setQuery] = useState("");
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -1452,7 +1504,9 @@ function RailSearch({
     inputRef.current?.focus();
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     const onDown = (e: MouseEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) onClose();
+      const t = e.target as Node;
+      if (!wrapRef.current?.contains(t) && !toggleRef.current?.contains(t))
+        onClose();
     };
     window.addEventListener("keydown", onKey);
     window.addEventListener("mousedown", onDown);
