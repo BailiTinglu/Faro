@@ -172,22 +172,27 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
   const [port, setPort] = useState(seed?.port ?? defaultPort);
   const [portTouched, setPortTouched] = useState<boolean>(!!seed?.port);
   const [username, setUsername] = useState(seed?.username ?? "");
+  // A duplicate's prefill carries the source's auth so only what differs needs
+  // retyping. A keychain-held key (keyref) is tied to the source's id and can't
+  // be copied, so a duplicate of one starts blank.
+  const seedAuth =
+    profile?.auth ?? (seed?.auth?.kind === "keyref" ? undefined : seed?.auth);
   const [authKind, setAuthKind] = useState<AuthMethod["kind"]>(
-    profile?.auth.kind ?? "password"
+    seedAuth?.kind ?? "password"
   );
   const [password, setPassword] = useState(
-    profile?.auth.kind === "password" ? profile.auth.password : ""
+    seedAuth?.kind === "password" ? seedAuth.password : ""
   );
   const [keyPath, setKeyPath] = useState(
-    profile?.auth.kind === "key" ? profile.auth.path : ""
+    seedAuth?.kind === "key" ? seedAuth.path : ""
   );
   const [passphrase, setPassphrase] = useState(
-    profile?.auth.kind === "key" ? profile.auth.passphrase ?? "" : ""
+    seedAuth?.kind === "key" ? seedAuth.passphrase ?? "" : ""
   );
   const [defaultRemotePath, setDefaultRemotePath] = useState(
     seed?.defaultRemotePath ?? "."
   );
-  const [autoConnect, setAutoConnect] = useState(profile?.autoConnect ?? false);
+  const [autoConnect, setAutoConnect] = useState(seed?.autoConnect ?? false);
   // FTP-only: path-name character set ("" = auto).
   const [ftpEncoding, setFtpEncoding] = useState(seed?.ftpEncoding ?? "");
   const [ftpActiveMode, setFtpActiveMode] = useState(seed?.ftpActiveMode ?? false);
@@ -441,7 +446,7 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
           ? { kind: "password", password: "" }
           : auth,
       defaultRemotePath: defaultRemotePath || undefined,
-      color: profile?.color,
+      color: seed?.color,
       autoConnect: autoConnect || undefined,
       bucket: isObject ? bucket : undefined,
       region: isS3 ? region : undefined,

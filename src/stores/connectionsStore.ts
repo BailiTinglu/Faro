@@ -38,6 +38,9 @@ interface ConnectionsState {
   connect: (profileId: string) => Promise<void>;
   /** Disconnect one session (defaults to the active one). */
   disconnect: (sessionId?: SessionId) => Promise<void>;
+  /** Drop a session (defaults to the active one) and open a fresh one to the
+   *  same profile — recovers a stale or dropped connection in one step. */
+  reconnect: (sessionId?: SessionId) => Promise<void>;
   /** Focus an already-open session. */
   setActiveSession: (sessionId: SessionId) => void;
 }
@@ -139,6 +142,14 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
     });
     void ipc.bridgeSetActiveSession(get().activeSessionId);
     toast.info("Disconnected", profile?.name);
+  },
+
+  reconnect: async (sessionId) => {
+    const sid = sessionId ?? get().activeSessionId;
+    const target = get().sessions.find((s) => s.sessionId === sid);
+    if (!target) return;
+    await get().disconnect(target.sessionId);
+    await get().connect(target.profileId);
   },
 
   setActiveSession: (sessionId) => {

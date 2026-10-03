@@ -9,6 +9,8 @@ import {
   TerminalSquare,
   Pencil,
   Trash2,
+  Copy,
+  RefreshCw,
   Power,
   Shield,
   X,
@@ -85,6 +87,7 @@ export function ServerRail() {
     loadProfiles,
     connect,
     disconnect,
+    reconnect,
     deleteProfile,
     setActiveSession,
     saveProfile,
@@ -93,6 +96,7 @@ export function ServerRail() {
   } = useConnections();
   const setTerminalOpen = useLayout((s) => s.setTerminalOpen);
   const openDialog = useLayout((s) => s.openDialog);
+  const openNewConnection = useLayout((s) => s.openNewConnection);
   const browseLocal = useLayout((s) => s.browseLocal);
   const setBrowseLocal = useLayout((s) => s.setBrowseLocal);
   const browserLayout = useSettings((s) => s.browserLayout);
@@ -426,6 +430,28 @@ export function ServerRail() {
       label: "Properties / Edit…",
       icon: <Pencil size={14} />,
       onClick: () => setEditing(p),
+    });
+    // Duplicate opens the New Connection editor seeded from this profile, so a
+    // sibling login (same host, different user/password) is a quick edit.
+    items.push({
+      label: "Duplicate…",
+      icon: <Copy size={14} />,
+      onClick: () => {
+        const { id: _id, sortOrder: _so, ...rest } = p;
+        const oauthAccount =
+          p.protocol === "dropbox" ||
+          p.protocol === "onedrive" ||
+          p.protocol === "gdrive" ||
+          p.protocol === "box" ||
+          p.protocol === "dynamics";
+        openNewConnection({
+          ...rest,
+          name: `${p.name} (copy)`,
+          autoConnect: undefined,
+          // OAuth tokens are keyed by profile id — the copy must sign in anew.
+          account: oauthAccount ? undefined : p.account,
+        });
+      },
       separatorAfter: true,
     });
     // Group membership: one flat item per existing group, plus "New group…".
@@ -464,6 +490,16 @@ export function ServerRail() {
       onClick: () => saveProfile({ ...p, autoConnect: !p.autoConnect }),
     });
     if (connected && sid) {
+      items.push({
+        label: "Reconnect",
+        icon: <RefreshCw size={14} />,
+        onClick: () => {
+          setPendingId(p.id);
+          reconnect(sid)
+            .then(() => setPendingId((cur) => (cur === p.id ? null : cur)))
+            .catch(() => {});
+        },
+      });
       items.push({
         label: "Disconnect",
         icon: <Unplug size={14} />,
