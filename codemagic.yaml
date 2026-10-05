@@ -35,15 +35,8 @@ workflows:
         script: |
           set -e
           source "$HOME/.cargo/env" 2>/dev/null || true
-          # Build macOS bundle (.dmg, .app)
           npm run tauri build
     artifacts:
       - src-tauri/target/release/bundle/dmg/*.dmg
       - src-tauri/target/release/bundle/macos/*.app
       - src-tauri/target/release/bundle/macos/*.tar.gz
-    publishing:
-      email:
-        recipients: []
-        notify:
-          on_success: true
-          on_failure: true
