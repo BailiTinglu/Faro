@@ -162,7 +162,7 @@ export function TerminalWindow() {
   }, []);
 
   return (
-    <div className="flex h-screen w-screen flex-col bg-bg">
+    <div className="flex h-full w-full flex-col bg-bg">
       <PopoutTitleBar title={title} exited={status === "exited"} />
       <div className="relative flex-1 overflow-hidden">
         <div
