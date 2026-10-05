@@ -589,6 +589,13 @@ textarea:focus-visible:not(.xterm-helper-textarea),
   animation: fadeInUp var(--dur-base) var(--ease-out-expo);
 }
 
+/* Constrain modal dialogs within the visible viewport under any zoom level */
+[role="dialog"].anim-modal,
+.fixed.inset-0 > .anim-modal {
+  max-width: 90% !important;
+  max-height: 85% !important;
+}
+
 @keyframes fadeIn {
   from {
     opacity: 0;

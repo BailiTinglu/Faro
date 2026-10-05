@@ -593,7 +593,7 @@ export function ProfileEditor({ profile, prefill, onClose }: Props) {
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
-        className="anim-modal flex max-h-[88vh] w-[52rem] max-w-[94vw] overflow-hidden rounded-xl border border-border bg-bg-panel shadow-elev-3"
+        className="anim-modal flex max-h-[85%] w-[48rem] max-w-[90%] overflow-hidden rounded-xl border border-border bg-bg-panel shadow-elev-3"
       >
         {/* Left rail — grouped protocol picker. Scrolls as the list grows so the
             dialog stays wide-and-short instead of tall-and-narrow. */}

@@ -395,7 +395,7 @@ export const useSettings = create<SettingsState>((set, get) => ({
   zoomReset: () => mutate(set, get, "uiZoom", 100),
 }));
 
-export const ZOOM_STEPS = [80, 90, 100, 110, 125, 140, 150, 175, 200];
+export const ZOOM_STEPS = [80, 90, 100, 110, 120, 125, 135, 150, 175, 200];
 
 /** Reload settings from faro.db and merge them into the live store. Used by
  *  windows that didn't get the pre-paint injection (popouts) and to reflect a

@@ -134,8 +134,9 @@ export function Settings({ onClose }: Props) {
                 options={[
                   { value: 100, label: "100%" },
                   { value: 110, label: "110%" },
+                  { value: 120, label: "120%" },
                   { value: 125, label: "125%" },
-                  { value: 140, label: "140%" },
+                  { value: 135, label: "135%" },
                   { value: 150, label: "150%" },
                 ]}
               />
@@ -534,10 +535,10 @@ export function Settings({ onClose }: Props) {
         aria-modal="true"
         aria-labelledby={titleId}
         onClick={(e) => e.stopPropagation()}
-        className="anim-modal flex h-[34rem] max-h-[88vh] w-[52rem] max-w-[94vw] overflow-hidden rounded-xl border border-border bg-bg-panel shadow-elev-3"
+        className="anim-modal flex max-h-[85%] w-[48rem] max-w-[90%] overflow-hidden rounded-xl border border-border bg-bg-panel shadow-elev-3"
       >
         {/* Left navigation — macOS / FileZilla-style section list. */}
-        <nav className="flex w-48 shrink-0 flex-col gap-0.5 border-r border-border bg-bg-subtle/50 p-2">
+        <nav className="flex w-48 shrink-0 flex-col gap-0.5 overflow-y-auto border-r border-border bg-bg-subtle/50 p-2">
           <div
             id={titleId}
             className="px-2 pb-2 pt-1 text-[15px] font-semibold tracking-tight"
