@@ -19,6 +19,8 @@ import {
   SplitSquareVertical,
   Maximize2,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { useConnections } from "@/stores/connectionsStore";
 import { useTransfers } from "@/stores/transfersStore";
@@ -170,6 +172,29 @@ export function useCommands(): Command[] {
       icon: <SunMoon size={14} />,
       combo: "mod+shift+t",
       run: () => setAppTheme(appTheme === "light" ? "dark" : "light"),
+    },
+    {
+      id: "zoom-in",
+      title: "Zoom In",
+      group: "View",
+      icon: <ZoomIn size={14} />,
+      combo: "mod+=",
+      run: () => useSettings.getState().zoomIn(),
+    },
+    {
+      id: "zoom-out",
+      title: "Zoom Out",
+      group: "View",
+      icon: <ZoomOut size={14} />,
+      combo: "mod+-",
+      run: () => useSettings.getState().zoomOut(),
+    },
+    {
+      id: "zoom-reset",
+      title: "Actual Size",
+      group: "View",
+      combo: "mod+0",
+      run: () => useSettings.getState().zoomReset(),
     },
   ];
 

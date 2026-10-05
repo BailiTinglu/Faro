@@ -124,6 +124,22 @@ export function Settings({ onClose }: Props) {
                 ]}
               />
             </Field>
+            <Field
+              label="UI Zoom"
+              help="Scale fonts, icons and interface elements for high-DPI displays."
+            >
+              <Segmented<number>
+                value={s.uiZoom}
+                onChange={s.setUiZoom}
+                options={[
+                  { value: 100, label: "100%" },
+                  { value: 110, label: "110%" },
+                  { value: 125, label: "125%" },
+                  { value: 140, label: "140%" },
+                  { value: 150, label: "150%" },
+                ]}
+              />
+            </Field>
           </>
         );
 
@@ -1048,7 +1064,7 @@ function AccentGrid({
   );
 }
 
-function Segmented<T extends string>({
+function Segmented<T extends string | number>({
   value,
   onChange,
   options,

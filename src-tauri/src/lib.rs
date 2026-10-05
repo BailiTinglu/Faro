@@ -102,6 +102,7 @@ fn build_settings_init_script(db: &db::Db) -> String {
            window.__FARO_SETTINGS__=s;\
            var el=document.documentElement;\
            if(el&&typeof s.appTheme==='string'){{el.setAttribute('data-theme',s.appTheme);}}\
+           if(el&&typeof s.uiZoom==='number'){{el.style.zoom=s.uiZoom+'%';}}\
          }}catch(e){{}}}})();"
     )
 }

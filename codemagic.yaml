@@ -1,0 +1,49 @@
+workflows:
+  macos-build:
+    name: Build Faro macOS (.dmg)
+    max_build_duration: 120
+    instance_type: mac_mini_m1
+    environment:
+      node: 20
+      xcode: latest
+    triggering:
+      events:
+        - push
+        - tag
+      branch_patterns:
+        - pattern: '*'
+          include: true
+          source: true
+    scripts:
+      - name: Set up Rust toolchain
+        script: |
+          set -e
+          if ! command -v rustc &> /dev/null; then
+            echo "Installing Rust toolchain..."
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            source "$HOME/.cargo/env"
+          else
+            rustup update stable || true
+          fi
+          rustc --version
+          cargo --version
+      - name: Install frontend dependencies
+        script: |
+          set -e
+          npm ci || npm install
+      - name: Build Faro Tauri desktop app
+        script: |
+          set -e
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          # Build macOS bundle (.dmg, .app)
+          npm run tauri build
+    artifacts:
+      - src-tauri/target/release/bundle/dmg/*.dmg
+      - src-tauri/target/release/bundle/macos/*.app
+      - src-tauri/target/release/bundle/macos/*.tar.gz
+    publishing:
+      email:
+        recipients: []
+        notify:
+          on_success: true
+          on_failure: true

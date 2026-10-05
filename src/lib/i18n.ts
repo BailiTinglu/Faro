@@ -30,6 +30,12 @@ const ZH: Record<string, string> = {
   "Color palette": "配色方案",
   "Theme default": "默认主题",
   Custom: "自定义",
+  "UI Zoom": "界面缩放",
+  "Scale fonts, icons and interface elements for high-DPI displays.":
+    "等比例缩放字体、图标与界面元素，适合高分屏和 Retina 显示。",
+  "Zoom In": "放大",
+  "Zoom Out": "缩小",
+  "Actual Size": "实际大小",
   Browse: "浏览…",
   Reset: "重置",
   Done: "完成",

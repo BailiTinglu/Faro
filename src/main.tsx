@@ -36,12 +36,18 @@ if (!document.documentElement.getAttribute("data-theme")) {
 // isn't part of the pre-paint injection; the store seeds it synchronously.)
 applyAccent(useSettings.getState().accentColor || null);
 
+function applyZoom(zoom: number) {
+  (document.documentElement.style as unknown as Record<string, string>).zoom = `${zoom}%`;
+}
+applyZoom(useSettings.getState().uiZoom || 100);
+
 // Keep the html data-theme in sync with the setting store. On an actual theme
 // change, add `.theming` so the (otherwise dormant) crossfade transition runs,
 // then drop it once the transition is done.
 let prevTheme = useSettings.getState().appTheme;
 let prevAccent = useSettings.getState().accentColor;
 let prevLanguage = useSettings.getState().uiLanguage;
+let prevZoom = useSettings.getState().uiZoom;
 let themingTimer: ReturnType<typeof setTimeout> | undefined;
 useSettings.subscribe((s) => {
   if (s.accentColor !== prevAccent) {
@@ -51,6 +57,10 @@ useSettings.subscribe((s) => {
   if (s.uiLanguage !== prevLanguage) {
     prevLanguage = s.uiLanguage;
     if (!pinnedLocale) applyUiLanguage(s.uiLanguage);
+  }
+  if (s.uiZoom !== prevZoom) {
+    prevZoom = s.uiZoom;
+    applyZoom(s.uiZoom || 100);
   }
   if (s.appTheme === prevTheme) return;
   prevTheme = s.appTheme;

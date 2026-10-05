@@ -44,8 +44,15 @@ export function useShortcuts() {
       // Guard the user's typing: bare-key combos don't fire from an input/
       // textarea/terminal. Modifier combos stay global.
       if (!hasMod && isEditableTarget(e.target)) return;
+
+      const matchCombo = (cCombo?: string) => {
+        if (!cCombo) return false;
+        if (cCombo === combo) return true;
+        if (cCombo === "mod+=" && (combo === "mod+shift++" || combo === "mod++")) return true;
+        return false;
+      };
       const cmd = ref.current.find(
-        (c) => c.combo === combo && c.enabled !== false
+        (c) => matchCombo(c.combo) && c.enabled !== false
       );
       if (cmd) {
         e.preventDefault();

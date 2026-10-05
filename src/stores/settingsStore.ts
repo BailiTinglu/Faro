@@ -87,6 +87,8 @@ interface SettingsState {
   accentColor: string;
   /** UI language. "system" follows the OS locale (Chinese only when it's zh). */
   uiLanguage: UiLanguage;
+  /** Global UI zoom scale in percent (e.g. 100, 110, 125, 140, 150). */
+  uiZoom: number;
 
   // Transfers
   overwritePolicy: OverwritePolicy;
@@ -176,6 +178,10 @@ interface SettingsState {
   setTerminalSuggestions: (v: boolean) => void;
   setDefaultPort: (n: number) => void;
   setNotifications: (v: NotificationSettings) => void;
+  setUiZoom: (n: number) => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
+  zoomReset: () => void;
 }
 
 const STORAGE_KEY = "faro.settings.v1";
@@ -212,12 +218,17 @@ type Persisted = Omit<
   | "setTerminalSuggestions"
   | "setDefaultPort"
   | "setNotifications"
+  | "setUiZoom"
+  | "zoomIn"
+  | "zoomOut"
+  | "zoomReset"
 >;
 
 const DEFAULTS: Persisted = {
   appTheme: "dark",
   accentColor: "",
   uiLanguage: "system",
+  uiZoom: 100,
   overwritePolicy: "overwrite",
   promptOnOverwrite: true,
   autoOpenTransferPanel: true,
@@ -369,7 +380,22 @@ export const useSettings = create<SettingsState>((set, get) => ({
     mutate(set, get, "terminalSuggestions", v),
   setDefaultPort: (n) => mutate(set, get, "defaultPort", n),
   setNotifications: (v) => mutate(set, get, "notifications", v),
+  setUiZoom: (n) => mutate(set, get, "uiZoom", Math.max(70, Math.min(250, n))),
+  zoomIn: () => {
+    const cur = get().uiZoom || 100;
+    const next = ZOOM_STEPS.find((z) => z > cur) ?? Math.min(250, cur + 10);
+    mutate(set, get, "uiZoom", next);
+  },
+  zoomOut: () => {
+    const cur = get().uiZoom || 100;
+    const prev =
+      [...ZOOM_STEPS].reverse().find((z) => z < cur) ?? Math.max(70, cur - 10);
+    mutate(set, get, "uiZoom", prev);
+  },
+  zoomReset: () => mutate(set, get, "uiZoom", 100),
 }));
+
+export const ZOOM_STEPS = [80, 90, 100, 110, 125, 140, 150, 175, 200];
 
 /** Reload settings from faro.db and merge them into the live store. Used by
  *  windows that didn't get the pre-paint injection (popouts) and to reflect a

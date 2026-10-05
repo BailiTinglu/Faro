@@ -26,6 +26,8 @@ import {
   Command as CommandIcon,
   Keyboard,
   Radio,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { useSettings } from "@/stores/settingsStore";
 import { useLayout } from "@/stores/layoutStore";
@@ -128,6 +130,24 @@ export function TitleBar() {
           icon: <CommandIcon size={11} />,
           shortcut: formatCombo("mod+k"),
           onClick: togglePalette,
+        },
+        { kind: "sep" },
+        {
+          label: "Zoom In",
+          icon: <ZoomIn size={11} />,
+          shortcut: comboOf("zoom-in") ?? formatCombo("mod+="),
+          onClick: () => useSettings.getState().zoomIn(),
+        },
+        {
+          label: "Zoom Out",
+          icon: <ZoomOut size={11} />,
+          shortcut: comboOf("zoom-out") ?? formatCombo("mod+-"),
+          onClick: () => useSettings.getState().zoomOut(),
+        },
+        {
+          label: "Actual Size",
+          shortcut: comboOf("zoom-reset") ?? formatCombo("mod+0"),
+          onClick: () => useSettings.getState().zoomReset(),
         },
         { kind: "sep" },
         {
